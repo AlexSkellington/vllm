@@ -1,0 +1,16 @@
+[Unit]
+Description=vLLM engine - Qwen3.8-27B INT4, TP2 on both 3090s (127.0.0.1:8000; lab-facing port is vllm-direct :8081)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/vllm/vllm-engine.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

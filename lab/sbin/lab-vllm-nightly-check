@@ -1,0 +1,20 @@
+#!/bin/bash
+# lab-vllm-nightly-check (AS1 CT100, weekly; 2026-11-14, Claude): tell a person when a newer vLLM nightly exists than
+# the one production is pinned to (/opt/vllm/engine.expect). Once per new version. Read-only.
+# An upgrade stays deliberate: build a candidate venv, re-apply the lab patches (/opt/vllm/apply_*), A/B it with
+# tools/as1/venv_ab.py -- vllm-postcheck verifies the patches + KV pool after any switch.
+set -u
+cur=$(grep -E '^VLLM_VERSION=' /opt/vllm/engine.expect | cut -d= -f2)
+state=/var/lib/lab-upstream/vllm-last-notified; mkdir -p "$(dirname $state)"
+newest=$(curl -s -m 60 https://wheels.vllm.ai/nightly/vllm/ | grep -o -E 'vllm-[0-9][^-]*-' | sed -E 's/^vllm-//; s/-$//; s/%2B/+/' | sort -u |
+  /root/vllm-venv-main/bin/python -c "
+import sys
+from packaging.version import Version
+v = [l.strip() for l in sys.stdin if l.strip() and l[0].isdigit()]
+print(max(v, key=Version) if v else '')")
+[ -n "$newest" ] || { echo "could not read the nightly index"; exit 1; }
+echo "production $cur, newest nightly $newest"
+if [ "$newest" != "$cur" ] && [ "$newest" != "$(cat $state 2>/dev/null)" ]; then
+  /usr/local/sbin/lab-notify "vLLM: newer nightly available" "Production runs $cur; the newest nightly is $newest.
+Not installed. To try it: build a candidate venv, re-apply the lab patches (/opt/vllm/apply_*), A/B with venv_ab.py; vllm-postcheck guards the switch." 2 "package" && echo "$newest" > $state
+fi

@@ -1,0 +1,77 @@
+diff --git a/.buildkite/test_areas/models_basic.yaml b/.buildkite/test_areas/models_basic.yaml
+index 24daf811cef4..6bc780f2da40 100644
+--- a/.buildkite/test_areas/models_basic.yaml
++++ b/.buildkite/test_areas/models_basic.yaml
+@@ -419,6 +419,9 @@ steps:
+   timeout_in_minutes: 20
+   device: b200-k8s
+   source_file_dependencies:
++  - vllm/model_executor/layers/linear.py
++  - vllm/model_executor/layers/mamba/gdn
++  - vllm/model_executor/layers/utils.py
+   - vllm/models/qwen3_5/
+   - vllm/model_executor/models/qwen3_next.py
+   - tests/models/qwen3_5/
+diff --git a/tests/models/qwen3_5/test_gdn_ba_overlap.py b/tests/models/qwen3_5/test_gdn_ba_overlap.py
+new file mode 100644
+index 000000000000..5f66ded27273
+--- /dev/null
++++ b/tests/models/qwen3_5/test_gdn_ba_overlap.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++from transformers import Qwen3NextConfig
++
++from tests.utils import init_test_distributed_environment
++from tests.v1.attention.utils import create_vllm_config
++from vllm.config import set_current_vllm_config
++from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
++    QwenGatedDeltaNetAttention,
++)
++from vllm.platforms import current_platform
++from vllm.utils.network_utils import get_open_port
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only overlap")
++def test_ba_proj_overlaps_on_aux_stream_with_default_linear_backend() -> None:
++    """A GEMM dispatch change must not silently disable the ba overlap."""
++    vllm_config = create_vllm_config(dtype="bfloat16")
++    with set_current_vllm_config(vllm_config):
++        init_test_distributed_environment(1, 1, 0, str(get_open_port()))
++        layer = QwenGatedDeltaNetAttention(
++            Qwen3NextConfig(
++                hidden_size=64,
++                linear_num_key_heads=2,
++                linear_num_value_heads=4,
++                linear_key_head_dim=8,
++                linear_value_head_dim=8,
++            ),
++            vllm_config,
++            prefix="model.layers.0.linear_attn",
++            overlap_ba_proj=True,
++        )
++    assert layer._ba_stream is not None
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index e1a105e5e102..64cc3055c9d5 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -57,7 +57,7 @@
+ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+ from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+ from vllm.model_executor.layers.quantization.inc import INCConfig
+-from vllm.model_executor.layers.utils import default_unquantized_gemm
++from vllm.model_executor.layers.utils import cuda_unquantized_gemm
+ from vllm.model_executor.model_loader.weight_utils import (
+     sharded_weight_loader,
+ )
+@@ -653,7 +653,7 @@ def __init__(
+             overlap_ba_proj
+             and current_platform.is_cuda()
+             and isinstance(ba_method, UnquantizedLinearMethod)
+-            and ba_method._gemm_impl is default_unquantized_gemm
++            and ba_method._gemm_impl is cuda_unquantized_gemm
+             and not vllm_config.parallel_config.use_ubatching
+             and vllm_config.lora_config is None
+         ):

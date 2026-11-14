@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""vllm-postcheck (AS1 CT100, 2026-11-14, Claude): after every vllm-engine start, prove the production promises held.
+Started by vllm-engine (ExecStartPost, --no-block); waits until the engine serves, then checks
+  * GPU KV pool >= 2 x --max-model-len (two full-length slots; the 11-08 probabilistic-draft change silently broke this)
+  * every lab patch is present in the venv the engine runs (upgrades replace the venv and drop them)
+  * the tiered KV offload connector loaded when the engine script asks for it
+  * the sampler-parity logits processor module is importable from the venv
+Exit 1 on any problem -> the unit fails -> the lab alert hook sends it to ntfy. VLLM_POSTCHECK_MIN_KV overrides the
+KV floor (testing). Read-only: never restarts or changes anything."""
+import json, os, re, subprocess, sys, time, urllib.request
+
+SCRIPT = open("/opt/vllm/vllm-engine.sh").read()
+VENV = re.search(r"exec\s+(/root/vllm-venv[\w.-]*)/bin/vllm", SCRIPT).group(1)  # the venv the engine actually runs
+MAXLEN = int(re.search(r"--max-model-len\s+(\d+)", SCRIPT).group(1))
+MIN_KV = int(os.environ.get("VLLM_POSTCHECK_MIN_KV", 2 * MAXLEN))
+SITE = next(p for p in (os.path.join(VENV, "lib", d, "site-packages") for d in os.listdir(os.path.join(VENV, "lib"))) if os.path.isdir(p))
+MARKERS = {
+    "split-K GEMV (lab patch)": "lab patch: VLLM_LAB_SKINNY_SPLITK",
+    "PCIe IPC all-reduce cap (lab patch)": "lab patch: VLLM_PCIE_IPC_MAX_TOKENS",
+    "live per-request stream metrics (lab patch)": "lab patch: live per-request timing metrics",
+    "MTP draft truncation (lab patch)": "LAB_DRAFT_TRUNC",
+}
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout
+
+
+since = sh("systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", "vllm-engine").strip()
+deadline = time.time() + 1200
+while time.time() < deadline:
+    try:
+        if json.load(urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=5)).get("data"):
+            break
+    except Exception:
+        pass
+    time.sleep(10)
+else:
+    print("engine did not start serving within 20 minutes"); sys.exit(1)
+
+log = sh("journalctl", "-u", "vllm-engine", "--since", since or "-30min", "--no-pager", "-o", "cat")
+problems = []
+kv = [int(m.replace(",", "")) for m in re.findall(r"GPU KV cache size: ([\d,]+) tokens", log)]
+if not kv:
+    problems.append("no 'GPU KV cache size' line in this start's log")
+elif kv[-1] < MIN_KV:
+    problems.append(f"KV pool {kv[-1]:,} tokens < {MIN_KV:,} (2 x max-model-len {MAXLEN:,}): two full-length slots no longer fit")
+vdir = os.path.join(SITE, "vllm")
+for name, marker in MARKERS.items():
+    if subprocess.run(["grep", "-rqF", marker, vdir]).returncode != 0:
+        problems.append(f"{name} missing from {VENV} (re-apply its /opt/vllm/apply_* script)")
+if "kv-transfer-config" in SCRIPT and "OffloadingConnector" not in log:
+    problems.append("engine script asks for the tiered KV offload, but the OffloadingConnector did not load")
+if "lab_llama_samplers" in SCRIPT and not os.path.exists(os.path.join(SITE, "lab_llama_samplers.py")):
+    problems.append(f"lab_llama_samplers.py (sampler parity) missing from {SITE}")
+
+if problems:
+    print("vllm-postcheck FAILED:\n- " + "\n- ".join(problems))
+    sys.exit(1)
+print(f"vllm-postcheck ok: KV {kv[-1]:,} tokens (>= {MIN_KV:,}), {len(MARKERS)} lab patches present, venv {VENV}")

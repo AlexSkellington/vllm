@@ -1,0 +1,6 @@
+# What vllm-envcheck asserts at every vllm-engine start. Update together with an upgrade (README "Upgrading vLLM").
+VENV=/root/vllm-venv-main
+VLLM_VERSION=0.33.0rc1.dev452+g8530a778f
+TORCH_VERSION=2.14.0+cu132
+TORCH_CUDA=13.2
+GPUS=2
