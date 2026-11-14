@@ -8,6 +8,7 @@ existing FlashInfer MNNVL/TRT-LLM all-reduce implementation, so it intentionally
 lives behind a separate wrapper and an opt-in environment variable.
 """
 
+import os
 from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -54,6 +55,8 @@ class FlashInferPcieIpcAllReduce:
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.workspace: Any | None = None
+        # lab patch: VLLM_PCIE_IPC_MAX_TOKENS (0/unset = upstream: every captured batch size).
+        self.max_tokens = int(os.environ.get("VLLM_PCIE_IPC_MAX_TOKENS", "0") or 0)
         self.hidden_dim = 0
         self.dtype: torch.dtype | None = None
 
@@ -113,6 +116,9 @@ class FlashInferPcieIpcAllReduce:
             return
 
         batches = tuple(sorted({int(size) for size in capture_sizes if size > 0}))
+        # lab patch: VLLM_PCIE_IPC_MAX_TOKENS -- prepare/tune only the batches this backend will serve.
+        if self.max_tokens:
+            batches = tuple(b for b in batches if b <= self.max_tokens)
         if not batches:
             logger.warning_once(
                 "FlashInfer PCIe IPC all-reduce has no CUDA Graph capture sizes "
@@ -164,6 +170,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.is_contiguous()
             and inp.dim() == 2
             and inp.shape[1] == self.hidden_dim
+            and (not self.max_tokens or inp.shape[0] <= self.max_tokens)
             and inp.dtype == self.dtype
             and workspace.supports(inp)
         )

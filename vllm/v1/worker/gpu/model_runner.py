@@ -1,3 +1,4 @@
+import os  # lab patch
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NOTE: Coding style guide for this file:
@@ -506,6 +507,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             }
             if self.vllm_config.watermark_config is None:
                 self.sampler = Sampler(**sampler_kwargs)
+                if self.speculator is not None and os.environ.get("VLLM_LAB_DRAFT_TRUNC", "1") == "1":
+                    self.speculator.lab_top_k = self.sampler.sampling_states.top_k.gpu  # lab patch
+                    self.speculator.lab_top_p = self.sampler.sampling_states.top_p.gpu
             else:
                 wm_config = self.vllm_config.watermark_config
                 watermarker = create_watermarker(wm_config)

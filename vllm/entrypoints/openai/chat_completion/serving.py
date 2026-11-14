@@ -848,6 +848,8 @@ class OpenAIServingChat(GenerateBaseServing):
                                 else None
                             ),
                         )
+                        if self.enable_per_request_metrics and (request.n or 1) == 1:  # lab patch: live per-request timing metrics
+                            chunk.metrics = build_per_request_timing_metrics(res.metrics, completion_tokens)
 
                     yield chunk
 

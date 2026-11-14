@@ -56,6 +56,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.core.sched.lab_prefill import completed as lab_prefill_completed
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -2330,6 +2331,8 @@ class Scheduler(SchedulerInterface):
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
                 continue
+
+            lab_prefill_completed(request, output_is_stale)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (

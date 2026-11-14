@@ -64,6 +64,31 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
     return hasattr(target_cls, "get_mtp_target_hidden_states")
 
 
+
+_LAB_TRUNC_K = 64
+
+
+def _lab_draft_truncate(logits, top_k, top_p, temperature):
+    """Mask draft logits outside the target's top-k (<= 64) / top-p support. Graph-safe (static shapes, no sync)."""
+    import torch
+    t = torch.where(temperature > 0, temperature, torch.ones_like(temperature)).unsqueeze(1).to(logits.dtype)
+    scaled = logits / t
+    kk = min(_LAB_TRUNC_K, logits.shape[-1])
+    v = torch.topk(scaled, kk, dim=-1).values.float()                 # [R, kk], descending
+    k = top_k.to(torch.long)
+    active = k <= kk
+    kc = k.clamp(min=1, max=kk)
+    ar = torch.arange(kk, device=logits.device).unsqueeze(0)
+    inside = ar < kc.unsqueeze(1)
+    pv = torch.softmax(torch.where(inside, v, torch.full_like(v, float("-inf"))), dim=-1)
+    before = torch.cumsum(pv, dim=-1) - pv                              # mass of the better-ranked tokens
+    keep = inside & ((before < top_p.float().unsqueeze(1)) | (ar == 0))
+    n = keep.sum(dim=-1).clamp(min=1)
+    thr = v.gather(1, (n - 1).unsqueeze(1))
+    thr = torch.where(active.unsqueeze(1), thr, torch.full_like(thr, float("-inf")))
+    return torch.where(scaled.float() >= thr, logits, torch.full_like(logits, float("-inf")))
+
+
 class BaseSpeculator(ABC):
     """Base class for V2 model runner speculators.
 
@@ -559,6 +584,10 @@ class DraftModelSpeculator(BaseSpeculator):
             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
 
         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
+        if draft_logits is not None and getattr(self, "lab_top_k", None) is not None:
+            # lab patch: draft from the target's top-k/top-p support (rejection sampling stays exact)
+            logits = _lab_draft_truncate(logits, self.lab_top_k[idx_mapping], self.lab_top_p[idx_mapping],
+                                         temperature[idx_mapping])
         if draft_logits is not None and self.draft_watermarker is not None:
             sampled = self.draft_watermarker.sample(
                 logits,

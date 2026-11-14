@@ -1485,6 +1485,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
+    # lab patch: VLLM_LAB_SKINNY_SPLITK (registered so the compile-cache key includes it)
+    "VLLM_LAB_SKINNY_SPLITK": lambda: os.getenv("VLLM_LAB_SKINNY_SPLITK", "0"),
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.
     "VLLM_USE_LAYERNAME": lambda: bool(int(os.getenv("VLLM_USE_LAYERNAME", "1"))),

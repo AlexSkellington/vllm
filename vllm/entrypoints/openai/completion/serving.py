@@ -482,6 +482,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             completion_tokens=completion_tokens,
                             total_tokens=prompt_tokens + completion_tokens,
                         )
+                        if self.enable_per_request_metrics and (request.n or 1) == 1:  # lab patch: live per-request timing metrics
+                            chunk.metrics = build_per_request_timing_metrics(res.metrics, completion_tokens)
 
                     response_json = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {response_json}\n\n"

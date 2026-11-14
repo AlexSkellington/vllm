@@ -145,7 +145,9 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     draft_head = share_target_lm_head(
         eagle_model,
         get_target_lm_head(target_model, target_language_model),
-        speculative_config.draft_lm_head_quantization,
+        # vllm#59740 (merged by hand onto main's helper): with a draft token map only its rows are quantized, in
+        # load_draft_token_map below, so the full head is shared unquantized here.
+        None if speculative_config.draft_token_map is not None else speculative_config.draft_lm_head_quantization,
     )
     if draft_head is not None:
         # MTP layers route logits through layer.shared_head.head, not
@@ -158,6 +160,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 if sh is not None and hasattr(sh, "head"):
                     del sh.head
                     sh.head = draft_head
+
+    # Only now does the drafter hold the lm_head it drafts with.
+    if speculative_config.draft_token_map is not None:
+        from vllm.model_executor.layers.draft_vocab import load_draft_token_map
+
+        load_draft_token_map(eagle_model, vllm_config)
 
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that

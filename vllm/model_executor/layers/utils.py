@@ -80,12 +80,60 @@ def apply_penalties(
     return logits
 
 
+# lab patch: VLLM_LAB_SKINNY_SPLITK (AS1, 2026-11-01) -- see /opt/vllm/apply_vllm_skinny_splitk.py
+import os as _lab_os
+
+_LAB_SKINNY = _lab_os.environ.get("VLLM_LAB_SKINNY_SPLITK", "0") == "1"
+_LAB_SKINNY_MIN_M, _LAB_SKINNY_MAX_M = 2, 8
+_LAB_SKINNY_BK = 256
+
+if _LAB_SKINNY:
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _lab_skinny_kernel(x_ptr, w_ptr, p_ptr, M, N, sxm, swn, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        pid_n = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        m = tl.program_id(2)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_s * BLOCK_K + tl.arange(0, BLOCK_K)
+        xv = tl.load(x_ptr + m * sxm + offs_k).to(tl.float32)
+        wv = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :], mask=offs_n[:, None] < N, other=0.0).to(tl.float32)
+        acc = tl.sum(wv * xv[None, :], axis=1)
+        tl.store(p_ptr + (pid_s * M + m) * N + offs_n, acc, mask=offs_n < N)
+
+
+def _lab_skinny_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    n, k = weight.shape
+    x2 = x.reshape(-1, k)
+    m = x2.shape[0]
+    if not (_LAB_SKINNY_MIN_M <= m <= _LAB_SKINNY_MAX_M) or not x2.is_contiguous() or not weight.is_contiguous():
+        return torch.nn.functional.linear(x, weight)
+    splits = k // _LAB_SKINNY_BK
+    part = torch.empty((splits, m, n), dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(n, 16), splits, m)
+    _lab_skinny_kernel[grid](x2, weight, part, m, n, x2.stride(0), weight.stride(0), BLOCK_N=16, BLOCK_K=_LAB_SKINNY_BK)
+    return part.sum(0).to(x.dtype).reshape(*x.shape[:-1], n)
+
+
+def _lab_skinny_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+if _LAB_SKINNY:
+    direct_register_custom_op(op_name="lab_skinny_linear", op_func=_lab_skinny_linear, fake_impl=_lab_skinny_linear_fake)
+
+
 def default_unquantized_gemm(
     layer: torch.nn.Module,
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
+    if (_LAB_SKINNY and bias is None and weight.dim() == 2 and weight.shape[0] <= 128 and weight.shape[1] >= 2048
+            and weight.shape[1] % _LAB_SKINNY_BK == 0 and x.dtype in (torch.bfloat16, torch.float16)
+            and weight.dtype == x.dtype and x.is_cuda):
+        return torch.ops.vllm.lab_skinny_linear(x, weight)
     return torch.nn.functional.linear(x, weight, bias)
 
 
@@ -621,6 +669,10 @@ def cuda_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if (_LAB_SKINNY and bias is None and weight.dim() == 2 and weight.shape[0] <= 128 and weight.shape[1] >= 2048
+            and weight.shape[1] % _LAB_SKINNY_BK == 0 and x.dtype in (torch.bfloat16, torch.float16)
+            and weight.dtype == x.dtype and x.is_cuda and not getattr(layer, "use_skinny_gemm", False)):
+        return torch.ops.vllm.lab_skinny_linear(x, weight)  # lab patch: VLLM_LAB_SKINNY_SPLITK
     # The op picks the config from the token count at runtime, so the choice
     # stays out of the compiled graph.
     if (
