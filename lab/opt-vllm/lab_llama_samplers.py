@@ -1,4 +1,4 @@
-"""lab_llama_samplers.py (2026-11-07, Claude) - llama.cpp's sampler chain as a vLLM Model Runner V2 logits processor.
+"""lab_llama_samplers.py (2026-11-07, Claude; 2026-11-17 sync-free early exit) - llama.cpp's sampler chain as a vLLM Model Runner V2 logits processor.
 
 Engine parity (user: "support natively both engines completely", "completely parity"): a request that uses llama.cpp's
 own sampling controls gets llama.cpp's sampling on vLLM. The AS1 gateway resolves such a request into
@@ -437,6 +437,17 @@ class LlamaSamplerChain(LogitsProcessor):
         return flags
 
     def apply(self, logits, ctx):
+        # 2026-11-17: sync-free early exit. vLLM calls every processor whenever ANY request in the batch needs logits
+        # processing (plain temperature/top-p/top-k sampling does); the .tolist() below is a blocking GPU->CPU copy, so
+        # check the CPU-side mapping first and only touch GPU tensors when a llama.cpp-chain request is in the batch.
+        cfg = self.cfg
+        if not cfg:
+            return logits
+        for s in ctx.idx_mapping_np:
+            if int(s) in cfg:
+                break
+        else:
+            return logits
         torch = self.torch
         slots = ctx.expanded_idx_mapping.tolist()
         mine = [i for i, s in enumerate(slots) if s in self.cfg]
