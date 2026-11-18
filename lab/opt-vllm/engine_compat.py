@@ -39,6 +39,25 @@ LLAMA_GATEWAY = frozenset(['n_predict', 'n_cmpl', 'n_probs', 'cache_prompt', 'gr
                            'reasoning_budget_message', 'reasoning_control', 'grammar_lazy', 'grammar_triggers'])
 # llama.cpp controls that need the lab processor even without sampler knobs
 PROCESSOR_CONTROLS = ('reasoning_budget_message', 'reasoning_control', 'post_sampling_probs')
+# 2026-11-17 (user: talk to vLLM in vLLM's own controls): the lab vLLM engine no longer loads lab_llama_samplers, so the
+# llama.cpp dialect is REFUSED with a pointer to vLLM's controls instead of being emulated (the emulation cost 14.5%
+# decode, and its mere presence cost every sampled request a GPU sync). The chain is on only when the engine script
+# loads the processor; LAB_LLAMA_CHAIN=1/0 overrides. Re-enable = add `--logits-processors
+# lab_llama_samplers:LlamaSamplerChain` to /opt/vllm/vllm-engine.sh and restart the engine and the gateway.
+def _llama_chain_enabled():
+    import os
+    v = os.environ.get("LAB_LLAMA_CHAIN")
+    if v is not None:
+        return v == "1"
+    try:
+        with open("/opt/vllm/vllm-engine.sh") as fh:
+            return "--logits-processors lab_llama_samplers" in fh.read()
+    except OSError:
+        return False
+
+
+LLAMA_CHAIN = _llama_chain_enabled()
+VLLM_EQUIVALENT = {"repeat_penalty": "repetition_penalty (vLLM applies it to the whole sequence, not the last repeat_last_n tokens)"}
 # llama.cpp controls with no object on this vLLM deployment (reported, never silently dropped)
 LLAMA_NOOP = {
     'id_slot': 'vLLM has no slots; its prefix cache is global, so slot affinity has nothing to pin',
@@ -81,7 +100,8 @@ def engine_contract(engine, native=None):
     chat_fields, completion_fields, source = _native_sets(native)
     if engine == "vllm":
         foreign = {
-            "llama.cpp_sampler_chain": sorted(LLAMA_SAMPLER) + ["(+ temperature, top_k, top_p, min_p, frequency/presence_penalty with llama.cpp meaning in a dialect request)"],
+            "llama.cpp_sampler_chain": (sorted(LLAMA_SAMPLER) + ["(+ temperature, top_k, top_p, min_p, frequency/presence_penalty with llama.cpp meaning in a dialect request)"]
+                                        if LLAMA_CHAIN else "refused: this engine runs vLLM sampling only (see VLLM_EQUIVALENT)"),
             "llama.cpp_gateway": sorted(LLAMA_GATEWAY - frozenset(LLAMA_PENDING)),
             "llama.cpp_noop": dict(LLAMA_NOOP),
             "llama.cpp_pending": dict(LLAMA_PENDING),
@@ -97,7 +117,8 @@ def engine_contract(engine, native=None):
             "foreign": foreign,
             "mapped": dict(ALIASES) if engine == "vllm" else {},
             "adapter": sorted(ADAPTER_FIELDS),
-            "unsupported": sorted(LLAMA_PENDING) if engine == "vllm" else [],
+            "unsupported": (sorted(LLAMA_PENDING) + ([] if LLAMA_CHAIN else sorted(LLAMA_SAMPLER) + list(PROCESSOR_CONTROLS) + ["grammar_lazy"])
+                            if engine == "vllm" else []),
             "unsupported_policy": "explicit error; no silent removal; no-ops reported in the response `compat` block",
         },
         "reasoning": "model chat template; router reasoning_effort mapping is published separately",
@@ -169,6 +190,13 @@ def translate_vllm(body, model_id=None, chat=True, native=None, gen_defaults=Non
     if body.get("reasoning_budget_message") is not None and not isinstance(body.get("reasoning_budget_message"), str):
         raise CompatibilityError("reasoning_budget_message must be a string")
     dialect = dialect or proc
+    if dialect and not LLAMA_CHAIN:
+        found = sorted(k for k in body if k in LLAMA_SAMPLER or (k in PROCESSOR_CONTROLS and body[k])
+                       or (k == "grammar_lazy" and body[k]))
+        hint = "; ".join(k + " -> " + VLLM_EQUIVALENT[k] for k in found if k in VLLM_EQUIVALENT)
+        raise CompatibilityError("llama.cpp-only request controls are not served by this vLLM engine (lab policy: use vLLM's "
+                                 "own controls): " + ", ".join(found) + (". vLLM equivalent: " + hint if hint else "")
+                                 + ". For llama.cpp sampling, use a llama.cpp model.")
     if dialect and body.get("use_beam_search"):
         raise CompatibilityError("use_beam_search selects vLLM's beam search; it cannot be combined with llama.cpp sampler controls")
     if dialect:
