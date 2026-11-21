@@ -86,6 +86,42 @@ _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
 }
 
 
+def _lab_humming_head(bits):  # lab lmhead_quant: weight-only uintN g128 head on Humming kernels
+    def make():
+        import vllm.utils.humming as _hm
+        from vllm.model_executor.layers.quantization.humming import HummingLayerQuantizationConfig, HummingLinearMethod
+        schema = _hm.BaseWeightSchema.from_config({'quant_method': 'humming', 'weight_dtype': 'uint%d' % bits, 'group_size': 128})
+        return HummingLinearMethod(HummingLayerQuantizationConfig(weight_schema=schema, is_online_quant=True))
+    return make
+
+
+for _lab_b in (5, 6, 8):
+    _LM_HEAD_METHODS['int%d' % _lab_b] = _lab_humming_head(_lab_b)
+
+
+def _lab_quantize_copy_int(lm_head, bits):
+    # Humming's online quant runs inside its weight loader; a copy is never loaded, so quantize this rank's shard
+    # with the schema directly and fill the created params in place (keeps their Humming attributes).
+    dtype = lm_head.weight.dtype
+    method = _lab_humming_head(bits)()
+    with set_default_torch_dtype(dtype):
+        head = ParallelLMHead(lm_head.num_embeddings, lm_head.embedding_dim, params_dtype=dtype,
+                              org_num_embeddings=lm_head.org_vocab_size, padding_size=lm_head.padding_size,
+                              prefix=lm_head.prefix, disable_tp=lm_head.disable_tp, quant_method=method)
+    tensors = method.weight_schema.quant_tensor(lm_head.weight.data, method.weight_schema, dtype)
+    for key, t in tensors.items():
+        if t is None or t.nelement() == 0:
+            continue
+        p = getattr(head, key)
+        assert tuple(p.shape) == tuple(t.shape), (key, tuple(p.shape), tuple(t.shape))
+        p.data = t.to(lm_head.weight.device)
+    method.process_weights_after_loading(head)
+    for param in head.parameters(recurse=False):
+        if hasattr(param, 'weight_loader'):
+            del param.weight_loader
+    return head
+
+
 def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead:
     if (
         not isinstance(
@@ -139,7 +175,7 @@ def quantized_lm_head_copy(
     unchanged and no bf16 copy of its weight is made. The copy is derived state:
     `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
     """
-    head = _quantize_copy(lm_head, quantization)
+    head = (_lab_quantize_copy_int(lm_head, int(quantization[3:])) if str(quantization).startswith('int') else _quantize_copy(lm_head, quantization))  # lab lmhead_quant
     # Keep it out of layerwise reload, which would re-run
     # process_weights_after_loading on the already-quantized weight.
     get_layerwise_info(head).reset()

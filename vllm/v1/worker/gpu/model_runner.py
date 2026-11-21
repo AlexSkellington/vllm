@@ -423,6 +423,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+        _lab_q = os.environ.get('LAB_TARGET_LM_HEAD_QUANT')  # lab lmhead_quant
+        if _lab_q:
+            from vllm.model_executor.layers.quantization.online import lm_head as _lab_lmh
+            _lab_lm = self.model.get_language_model() if hasattr(self.model, 'get_language_model') else self.model
+            _lab_owner = _lab_lm if getattr(_lab_lm, 'lm_head', None) is not None else self.model
+            _lab_old = _lab_owner.lm_head
+            _lab_owner.lm_head = _lab_lmh.quantized_lm_head_copy(_lab_old, _lab_q)
+            if getattr(self.model, 'lm_head', None) is _lab_old:
+                self.model.lm_head = _lab_owner.lm_head
+            for _lab_k in [k for k, v in list(_lab_lmh._SOURCES.items()) if v[0] is _lab_old]:
+                del _lab_lmh._SOURCES[_lab_k]
+            del _lab_old
+            import gc as _lab_gc
+            _lab_gc.collect()
+            torch.cuda.empty_cache()
+            logger.info('lab: target lm_head replaced by a %s copy', _lab_q)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
