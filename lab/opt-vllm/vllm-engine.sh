@@ -6,7 +6,7 @@
 #  - 2026-11-08: draft_sample_method probabilistic (was greedy default): sampled single 128.3 -> 137.6 tok/s (+7.3%), pairs 223.7 -> 241.0 (+7.8%), acceptance 0.584 -> 0.671 (venv_ab.py probonly ABBA). Rejection sampling is exact. Rollback: /root/backports/vllm-engine.sh.bak-probdraft-*
 #  - MTP 2 (3 = no single-stream gain, 943 -> 683 tok/s at 32 streams). Drafter uses a private NVFP4 copy of the shared
 #    bf16 lm_head (vllm#59973 backport, 2026-11-01): decode +7.8%, 32k +7.2%, edits wall -11%, KV pool -3.7%.
-#  - --prefix-match-unit 32 + --enable-mamba-shared-prefix-checkpoint: per-turn agent TTFT 1.98 -> 0.86 s @30k,
+#  - --prefix-match-unit 48 + --enable-mamba-shared-prefix-checkpoint: per-turn agent TTFT 1.98 -> 0.86 s @30k,
 #    2.93 -> 1.26 s @100k (hybrid GDN state is only checkpointed on 1,600-token blocks otherwise).
 #  - --enable-prompt-tokens-details: cached_tokens in usage -> llama.cpp-style timings.cache_n in the gateway.
 #  - 2026-11-02: vLLM main nightly 0.33.0rc1.dev452+g8530a778f (/root/vllm-venv-main: +#64999, PCIe-IPC cap, split-K re-targeted
@@ -23,14 +23,21 @@
 #    12.87 s -> 2.23 s, identical output. --max-num-seqs 64 (default 128) frees the probabilistic-draft buffers:
 #    KV 519,819 -> 552,587 (2.1x 262k). A/B kvoff2: decode +0.55%, pairs +0.35%, prefill flat. Trim: vllm-kvcache-trim.timer.
 #    Rollback: /opt/vllm/vllm-engine.sh.bak-pre-kvoff-20261109-205558
-export VLLM_USE_BREAKABLE_CUDAGRAPH=0 HOME=/root PATH=/root/vllm-venv-main/bin:/usr/bin:/bin
+#  - 2026-11-21 (Claude, user go-ahead "B + speed levers, ship the winner"): weights = BF16 checkpoint quantized at load by
+#    Humming (int4 g64; FFN gate/up blocks 48-63 int6; MTP draft layer int5) + lossless int8 target lm_head (fork
+#    02236835c, LAB_TARGET_LM_HEAD_QUANT) + nvfp4 KV + prefix-match-unit 48. vs previous: +3..5.5% tok/s, 4-stream +8%,
+#    KV 1.76x, KLD 0.042 -> 0.035. Tables: bench/llamacpp-patches/AMPERE-VLLM-QUANT-TABLE.md. Rollback: deploy_b.py --rollback
+#    (or copy /opt/vllm/vllm-engine.sh.bak-pre-B-20261121-174740 back).
+export VLLM_HUMMING_ONLINE_QUANT_CONFIG='{"weight_dtype": "uint4", "group_size": 64, "ignore": ["visual", "lm_head", "in_proj_ba"], "dynamic": {"+:.*mtp.*": {"weight_dtype": "uint5", "group_size": 128}, "+:.*\\.layers\\.(4[89]|5[0-9]|6[0-3])\\.mlp\\.gate_up_proj.*": {"weight_dtype": "uint6", "group_size": 128}}}'
+export LAB_TARGET_LM_HEAD_QUANT=int8
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0 HOME=/root PATH=/root/vllm-venv-lab-02236835c/bin:/usr/bin:/bin
 # Fetch the authoritative policy; generated last-good cache allows an independent boot.
-GENERATION_OVERRIDE=$(/root/vllm-venv-main/bin/python /opt/vllm/shared_generation_policy.py) || exit 1
-exec /root/vllm-venv-main/bin/vllm serve /root/models-vllm/qwen38-int4 \
+GENERATION_OVERRIDE=$(/root/vllm-venv-lab-02236835c/bin/python /opt/vllm/shared_generation_policy.py) || exit 1
+exec /root/vllm-venv-lab-02236835c/bin/vllm serve /root/models-vllm/qwen38-bf16 \
   --served-model-name Qwen3.8-27B-INT4 --tensor-parallel-size 2 \
   --max-model-len 262144 --gpu-memory-utilization 0.92 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_lm_head_quantization":"nvfp4","draft_sample_method":"probabilistic"}' \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --prefix-match-unit 32 --enable-mamba-shared-prefix-checkpoint --enable-prompt-tokens-details --enable-per-request-metrics \
+  --prefix-match-unit 48 --enable-mamba-shared-prefix-checkpoint --enable-prompt-tokens-details --enable-per-request-metrics \
   --override-generation-config "$GENERATION_OVERRIDE" \
-  --compilation-config '{"cudagraph_capture_sizes": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]}' --host 127.0.0.1 --port 8000 --disable-uvicorn-access-log --max-num-seqs 64 --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":17179869184,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kvcache"}]}}'
+  --compilation-config '{"cudagraph_capture_sizes": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]}' --host 127.0.0.1 --port 8000 --disable-uvicorn-access-log --max-num-seqs 64 --quantization humming --kv-cache-dtype nvfp4 --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":17179869184,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kvcache"}]}}'
