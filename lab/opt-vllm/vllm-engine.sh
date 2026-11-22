@@ -34,15 +34,16 @@
 #    Rollback: tools/as1/deploy_g.py --rollback (or copy /opt/vllm/vllm-engine.sh.bak-pre-G-20261121-222304 back).
 unset VLLM_HUMMING_ONLINE_QUANT_CONFIG
 export LAB_TARGET_LM_HEAD_QUANT=int8
-export VLLM_USE_BREAKABLE_CUDAGRAPH=0 HOME=/root PATH=/root/vllm-venv-lab-49c378ac4/bin:/usr/bin:/bin
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0 HOME=/root PATH=/root/vllm-venv-lab-f1f26d59b/bin:/usr/bin:/bin
 # Fetch the authoritative policy; generated last-good cache allows an independent boot.
-GENERATION_OVERRIDE=$(/root/vllm-venv-lab-49c378ac4/bin/python /opt/vllm/shared_generation_policy.py) || exit 1
+GENERATION_OVERRIDE=$(/root/vllm-venv-lab-f1f26d59b/bin/python /opt/vllm/shared_generation_policy.py) || exit 1
 #  - 2026-11-22 01:52 (Claude, deploy_swap.py): weights /root/models-vllm/q38-hrtn-B -> /root/models-vllm/q38-imxu-R1, edits [['"num_speculative_tokens":2', '"num_speculative_tokens":3'], ['"draft_sample_method":"probabilistic"}', '"draft_sample_method":"probabilistic","draft_token_map":"/opt/vllm/draft-ids-64k.json"}'], ['--prefix-match-unit 48', '--prefix-match-unit 32']]; rollback: tools/as1/deploy_swap.py --rollback
-exec /root/vllm-venv-lab-49c378ac4/bin/vllm serve /root/models-vllm/q38-imxu-R1 \
+#  - 2026-11-22 14:48 (Claude, deploy_swap.py): weights /root/models-vllm/q38-imxu-R1 -> /root/models-vllm/q38-imxu-R1, edits [['--kv-cache-dtype nvfp4', '--kv-cache-dtype fp8'], ['--gpu-memory-utilization 0.92', '--gpu-memory-utilization 0.94']]; rollback: tools/as1/deploy_swap.py --rollback
+exec /root/vllm-venv-lab-f1f26d59b/bin/vllm serve /root/models-vllm/q38-imxu-R1 \
   --served-model-name Qwen3.8-27B-INT4 --tensor-parallel-size 2 \
-  --max-model-len 262144 --gpu-memory-utilization 0.92 \
+  --max-model-len 262144 --gpu-memory-utilization 0.94 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_lm_head_quantization":"nvfp4","draft_sample_method":"probabilistic","draft_token_map":"/opt/vllm/draft-ids-64k.json"}' \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --prefix-match-unit 32 --enable-mamba-shared-prefix-checkpoint --enable-prompt-tokens-details --enable-per-request-metrics \
   --override-generation-config "$GENERATION_OVERRIDE" \
-  --compilation-config '{"cudagraph_capture_sizes": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]}' --host 127.0.0.1 --port 8000 --disable-uvicorn-access-log --max-num-seqs 64 --kv-cache-dtype nvfp4 --kernel-config '{"linear_backend_per_quant": {"mixed_precision": "humming"}}' --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 16}' --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":17179869184,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kvcache"}]}}'
+  --compilation-config '{"cudagraph_capture_sizes": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]}' --host 127.0.0.1 --port 8000 --disable-uvicorn-access-log --max-num-seqs 64 --kv-cache-dtype fp8 --kernel-config '{"linear_backend_per_quant": {"mixed_precision": "humming"}}' --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 16}' --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":17179869184,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kvcache"}]}}'
