@@ -432,6 +432,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _lab_owner.lm_head = _lab_lmh.quantized_lm_head_copy(_lab_old, _lab_q)
             if getattr(self.model, 'lm_head', None) is _lab_old:
                 self.model.lm_head = _lab_owner.lm_head
+            _lab_dm = getattr(getattr(self, 'speculator', None), 'model', None)  # token-map drafter: frees the bf16 head
+            if (_lab_dm is not None and getattr(_lab_dm, 'lm_head', None) is _lab_old
+                    and getattr(getattr(_lab_dm, 'draft_vocab', None), 'token_ids', None) is not None):
+                _lab_dm.lm_head = _lab_owner.lm_head
             for _lab_k in [k for k, v in list(_lab_lmh._SOURCES.items()) if v[0] is _lab_old]:
                 del _lab_lmh._SOURCES[_lab_k]
             del _lab_old

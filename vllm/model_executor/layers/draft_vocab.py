@@ -103,6 +103,11 @@ def _quantize_rows(
     """
     if ids is None:
         ids = torch.arange(weight.shape[0], device=weight.device)
+    if quantization == "nvfp4" and torch.cuda.get_device_capability(weight.device)[0] < 10:
+        # lab (AS1 2026-11-22): no SM100 fp4 quant kernel -> reference quantizer (subset amax for the global scale)
+        from vllm.model_executor.layers.quantization.online.lm_head import _quantize_nvfp4
+
+        return _quantize_nvfp4(weight[ids])
     if quantization == "nvfp4":
         fp4_fp8_max = FLOAT4_E2M1_MAX * torch.finfo(torch.float8_e4m3fn).max
         global_scale = fp4_fp8_max / weight_amax(weight).float().clamp(min=1e-12)
@@ -424,6 +429,7 @@ class DraftVocab:
         self.token_ids: torch.Tensor | None = None
         self.rows: _Rows | None = None
         self.num_dynamic_rows = 0
+        self.tp_cols: torch.Tensor | None = None  # lab: TP token map
 
     def compute_logits(
         self, lm_head: VocabParallelEmbedding, hidden_states: torch.Tensor
@@ -509,8 +515,8 @@ class DraftVocab:
                 "without bias, logit scaling or soft capping, run in its weight "
                 "dtype."
             )
-        if head.tp_size > 1:
-            raise ValueError("draft_token_map does not support tensor parallelism.")
+        if head.tp_size > 1 and dynamic_rows > 0:
+            raise ValueError("draft_token_map_dynamic_rows does not support tensor parallelism.")
 
         vocab_size = head.org_vocab_size
         bad = token_ids[(token_ids < 0) | (token_ids >= vocab_size)]
@@ -520,9 +526,13 @@ class DraftVocab:
                 f"e.g. {bad[:5].tolist()}."
             )
 
-        weight = head.weight[:vocab_size]
-        self.token_ids = token_ids.to(weight.device)
-        self.rows = _Rows(weight[self.token_ids], quantization)
+        if head.tp_size > 1:  # lab (AS1 2026-11-22): rows split by vocab shard, logits all-gathered
+            weight = head.weight
+            self._init_tp_rows(head, token_ids, quantization)
+        else:
+            weight = head.weight[:vocab_size]
+            self.token_ids = token_ids.to(weight.device)
+            self.rows = _Rows(weight[self.token_ids], quantization)
         self.num_dynamic_rows = dynamic_rows
         if dynamic_rows > 0:
             self._init_dynamic_rows(weight, quantization)
@@ -534,6 +544,27 @@ class DraftVocab:
             dynamic_rows,
             quantization or weight.dtype,
         )
+
+    def _init_tp_rows(self, head, token_ids: torch.Tensor, quantization: str | None) -> None:
+        """Listed rows of this rank's vocab shard; `tp_cols` selects the real columns of the all-gathered logits
+        and `token_ids` holds their target ids in gathered order."""
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        si = head.shard_indices
+        lo, hi = si.org_vocab_start_index, si.org_vocab_end_index
+        dev = head.weight.device
+        ids = token_ids.to(dev)
+        local = ids[(ids >= lo) & (ids < hi)]
+        n_local = torch.tensor([local.numel()], device=dev, dtype=torch.long)
+        n_max = int(tensor_model_parallel_all_gather(n_local, dim=0).max())
+        n_max = (n_max + 127) // 128 * 128
+        pad = n_max - local.numel()
+        rows_idx = torch.cat([local - lo, torch.zeros(pad, dtype=torch.long, device=dev)])
+        self.rows = _Rows(head.weight[rows_idx], quantization)
+        tagged = torch.cat([local, torch.full((pad,), -1, dtype=torch.long, device=dev)])
+        all_ids = tensor_model_parallel_all_gather(tagged, dim=0)
+        self.tp_cols = (all_ids >= 0).nonzero()[:, 0]
+        self.token_ids = all_ids[self.tp_cols]
 
     def _init_dynamic_rows(self, weight: torch.Tensor, quantization: str | None):
         """Score the rows outside the list with a rank-256 lm_head factor.
@@ -583,6 +614,10 @@ class DraftVocab:
         positions in `candidate_ids`."""
         assert self.rows is not None
         logits = self.rows(hidden_states)
+        if self.tp_cols is not None:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            logits = tensor_model_parallel_all_gather(logits.contiguous(), dim=-1).index_select(-1, self.tp_cols)
         if self.num_dynamic_rows == 0:
             return logits, None
         scores = self.scorer(hidden_states @ self.basis)
