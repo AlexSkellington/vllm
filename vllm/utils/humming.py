@@ -110,6 +110,9 @@ def create_humming_locks(device: torch.device | str) -> torch.Tensor:
 
 
 def __getattr__(name: str) -> Any:
+    from vllm.utils import _lab_humming_cache  # lab: stable JIT cache keys across venvs
+
+    _lab_humming_cache.install()
     spec = _EXPORTS.get(name)
     if spec is None:
         raise AttributeError(f"module 'vllm.utils.humming' has no attribute {name!r}")
