@@ -1589,9 +1589,25 @@ def convert_to_wna16_moe_kernel_format(
                 input_schema=HummingInputSchema(),
             )
         else:
-            convert_to_humming_moe_kernel_format(
-                layer, quant_config=_humming_wna16_weight_schema(quant_config)
-            )
+            book = {"lab_iq4nl": "iq4nl", "lab_iq4nl7": "iq4nl7"}.get(getattr(quant_config, "observer", None))
+            if book is None:
+                convert_to_humming_moe_kernel_format(
+                    layer, quant_config=_humming_wna16_weight_schema(quant_config)
+                )
+            else:  # lab (AS1 2026-11-22): codebook experts
+                from vllm.utils.humming import BaseWeightSchema, HummingInputSchema, dtypes
+
+                inner = BaseWeightSchema.from_config(_humming_wna16_weight_schema(quant_config))
+
+                class _CodebookSchema:
+                    def convert_humming(self, *args, **kwargs):
+                        schema, tensors = inner.convert_humming(*args, **kwargs)
+                        schema.b_dtype = dtypes.DataType.from_str(book)
+                        return schema, tensors
+
+                convert_to_humming_moe_kernel_format(
+                    layer, weight_schema=_CodebookSchema(), input_schema=HummingInputSchema()
+                )
         return None
 
     if backend in (

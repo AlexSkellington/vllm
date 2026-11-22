@@ -55,6 +55,8 @@ class HummingLinearKernel(MPLinearKernel):
             "has_zero_point": self.config.zero_points,
         }
 
+        if getattr(layer, "_lab_codebook", None) is not None:  # lab: codebook indices, table dequant
+            quant_config["dtype"] = layer._lab_codebook
         if self.config.zero_points:
             assert self.w_zp_name is not None
             name_map["zero_point"] = self.w_zp_name

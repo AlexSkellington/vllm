@@ -69,7 +69,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         group_size: int | None = None,
         symmetric: bool | None = True,
         layer_name: str | None = None,
+        codebook: str | None = None,
     ):
+        self.codebook = codebook  # lab: "iq4nl7" -> Humming Iq4nl7Type (table dequant)
         self.num_bits = num_bits
         self.pack_factor = Fraction(32, num_bits)
         self.strategy = strategy
@@ -235,6 +237,15 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
         )
 
+        if self.codebook is not None:
+            from vllm.model_executor.kernels.linear.mixed_precision.humming import HummingLinearKernel
+
+            if kernel_type is not HummingLinearKernel or self.num_bits != 4 or not self.symmetric:
+                raise ValueError(
+                    f"codebook {self.codebook} weights need 4-bit symmetric layers on Humming, got {backend_name}; "
+                    "set --kernel-config '{\"linear_backend_per_quant\": {\"mixed_precision\": \"humming\"}}'"
+                )
+            layer._lab_codebook = self.codebook
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)
         layer.register_parameter("weight_shape", weight_shape)

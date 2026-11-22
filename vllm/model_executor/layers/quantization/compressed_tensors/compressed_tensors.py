@@ -871,6 +871,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 symmetric=weight_quant.symmetric,
                 group_size=weight_quant.group_size,
                 layer_name=layer_name,
+                # lab (AS1 2026-11-22): 4-bit codebook indices for the lab Humming Iq4nl7Type kernel
+                codebook={"lab_iq4nl": "iq4nl", "lab_iq4nl7": "iq4nl7"}.get(getattr(weight_quant, "observer", None)),
             )
 
         act_quant_format = is_activation_quantization_format(format)
