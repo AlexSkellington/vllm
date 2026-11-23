@@ -47,6 +47,45 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
+
+
+# --- lab LAB_FI_UBPLAN: sync-free decode metadata under speculative decoding (labpatch fi_ubplan) ---
+_LAB_FI_UBPLAN = __import__('os').environ.get('LAB_FI_UBPLAN', '1') != '0'
+
+
+@triton.jit
+def _lab_fix_last_page_len_kernel(indptr_ptr, last_ptr, seq_lens_ptr, n, page_size, BLOCK: tl.constexpr):
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = o < n
+    a = tl.load(indptr_ptr + o, mask=m, other=0)
+    b = tl.load(indptr_ptr + o + 1, mask=m, other=0)
+    s = tl.load(seq_lens_ptr + o, mask=m, other=0).to(tl.int32)
+    old = tl.load(last_ptr + o, mask=m, other=0)
+    p = b - a
+    tl.store(last_ptr + o, tl.where(p > 0, s - (p - 1) * page_size, old), mask=m)
+
+
+def _lab_fix_last_page_len(indptr_gpu, last_gpu, seq_lens_gpu, n, page_size):
+    if n > 0:
+        _lab_fix_last_page_len_kernel[(triton.cdiv(n, 128),)](indptr_gpu, last_gpu, seq_lens_gpu, n, page_size,
+                                                              BLOCK=128)
+
+
+def _lab_pin_ring_next(wrapper):
+    """Swap the wrapper's pinned plan-info buffer for the ring slot not used by the previous plan; wait for that
+    slot's last async H2D copy (normally long done). Returns the slot to record the new plan's event on."""
+    ring = getattr(wrapper, "_lab_pin_ring", None)
+    if ring is None:
+        b0 = wrapper._pin_memory_int_workspace_buffer
+        b1 = torch.empty(b0.shape, dtype=b0.dtype, pin_memory=True)
+        ring = wrapper._lab_pin_ring = [[b0, torch.cuda.Event(), False], [b1, torch.cuda.Event(), False]]
+        wrapper._lab_pin_i = 0
+    wrapper._lab_pin_i ^= 1
+    slot = ring[wrapper._lab_pin_i]
+    if slot[2]:
+        slot[1].synchronize()
+    wrapper._pin_memory_int_workspace_buffer = slot[0]
+    return slot
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
     flashinfer_xqa_batch_decode_with_kv_cache,
@@ -1678,6 +1717,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             decode=None,
         )
 
+        _lab_ub = False
+        if (_LAB_FI_UBPLAN and self._num_speculative_tokens > 0 and num_prefills == 0 and num_decodes > 0
+                and not self.use_dcp and not all_uses_trtllm and not decode_with_flashinfer_trtllm_api
+                and common_attn_metadata.seq_lens_cpu_upper_bound is not None
+                and self.enable_cuda_graph and num_decode_tokens <= self._decode_cudagraph_max_bs):
+            if self.use_fa2_native_decode:
+                _lab_key = (num_decodes, num_decode_tokens // num_decodes)
+            else:
+                _lab_key = (num_decode_tokens, 1)
+            _lab_w = self._decode_wrappers_cudagraph.get(_lab_key)
+            _lab_ub = _lab_w is not None and not getattr(_lab_w, 'vllm_first_call', True)
         # Guard access to seq_lens_cpu, which may not always be needed
         # and can be expensive to retrieve in async mode.
         # When all attention (both prefill and decode) uses TRTLLM,
@@ -1691,6 +1741,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ):
                 # No speculative token accounting, so the upper bound is exact.
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            elif _lab_ub:  # lab fi_ubplan: plan on the host upper bound, real lengths fixed on the GPU below
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound[: seq_lens.shape[0]]
             else:
                 with gpu_sync_allowed():
                     seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
@@ -1747,6 +1799,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_reqs,
                 page_size,
             )
+            if _lab_ub:
+                _lab_fix_last_page_len(self.paged_kv_indptr.gpu, self.paged_kv_last_page_len.gpu, seq_lens,
+                                       num_reqs, page_size)
         else:
             paged_kv_indices = None
 
@@ -2948,6 +3003,7 @@ def fast_plan_decode(
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
 
+    _lab_slot = _lab_pin_ring_next(self) if _LAB_FI_UBPLAN else None
     fast_decode_plan(
         self,
         indptr=indptr_cpu,
@@ -2971,6 +3027,9 @@ def fast_plan_decode(
         disable_split_kv=disable_split_kv,
         q_len_per_req=q_len_per_req,
     )
+    if _lab_slot is not None:  # lab fi_ubplan: this slot's H2D copy is now queued on the stream
+        _lab_slot[1].record()
+        _lab_slot[2] = True
 
 
 @triton.jit
