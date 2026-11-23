@@ -24,6 +24,7 @@ from vllm.platforms import current_platform
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
+from . import lab_int8_allreduce as _lab_i8
 
 logger = init_logger(__name__)
 
@@ -382,6 +383,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # lab: int8 all-reduce for prefill-sized messages (lab_int8_allreduce.py; opt out LAB_AR_INT8=0)
+        if _lab_i8.applies(input_, self.world_size):
+            _lab_out = _lab_i8.all_reduce(self.pynccl_comm, input_)
+            if _lab_out is not None:
+                return _lab_out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
