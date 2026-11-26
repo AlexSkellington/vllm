@@ -89,7 +89,17 @@ class LabIpcAllGather:
         _fn, args = reduce_tensor(self.own_buf)
         gathered: list = [None] * 2
         dist.all_gather_object(gathered, args, group=cpu_group)
-        self.peer_buf = rebuild_cuda_tensor(*gathered[1 - rank])
+        peer_args = list(gathered[1 - rank])
+        # Rebuild the peer storage in OUR device context. The pickled
+        # storage_device (arg 6) is the peer ordinal; taken as-is it opens
+        # the IPC handle in the peer device context. Host copies work from
+        # there (canary) but triton's context-relative cuPointerGetAttribute
+        # pointer check rejects the pointer when the kernel launches on our
+        # own device. _share_cuda_ yields torch's C++ device encoding (a
+        # Python pickle is rejected by _new_shared_cuda).
+        _dev_bytes = torch.empty(8, device=self.device)._typed_storage()._share_cuda_()[0]
+        peer_args[6] = _dev_bytes
+        self.peer_buf = rebuild_cuda_tensor(*peer_args)
         self.own_flag = self.own_buf[2 * slot:2 * slot + FLAG_BYTES].view(torch.uint64)
         self.peer_flag = self.peer_buf[2 * slot:2 * slot + FLAG_BYTES].view(torch.uint64)
 
