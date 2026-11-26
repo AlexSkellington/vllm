@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -25,6 +27,7 @@ from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 from . import lab_int8_allreduce as _lab_i8
+from .lab_ipc_allgather import LabIpcAllGather
 
 logger = init_logger(__name__)
 
@@ -112,6 +115,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
+
+        self.lab_ipc_ag: LabIpcAllGather | None = None
+        # lab: int8 AR payload exchange over persistent CUDA-IPC buffers (v3);
+        # replaces the NCCL all-gather that deadlocked on mixed prefill+decode
+        # steps. TP2 only; auto-disables on any setup failure (NCCL path kept).
+        if (
+            self.world_size > 1
+            and unique_name.split(":")[0] == "tp"
+            and os.environ.get("LAB_AR_INT8", "1") != "0"
+            and os.environ.get("LAB_AR_IPC", "auto") != "0"
+        ):
+            try:
+                self.lab_ipc_ag = LabIpcAllGather(
+                    self.cpu_group, self.device, self.rank, self.world_size
+                )
+            except Exception:
+                logger.exception(
+                    "lab IPC all-gather setup failed; falling back to NCCL all-gather"
+                )
+                self.lab_ipc_ag = None
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
@@ -385,7 +408,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_):
         # lab: int8 all-reduce for prefill-sized messages (lab_int8_allreduce.py; opt out LAB_AR_INT8=0)
         if _lab_i8.applies(input_, self.world_size):
-            _lab_out = _lab_i8.all_reduce(self.pynccl_comm, input_)
+            _lab_out = _lab_i8.all_reduce(self.pynccl_comm, input_, self.lab_ipc_ag)
             if _lab_out is not None:
                 return _lab_out
         fi_ar_comm = self.fi_ar_comm
