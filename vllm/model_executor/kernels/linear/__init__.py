@@ -888,7 +888,10 @@ def init_int8_linear_kernel(
 
 
 def choose_mp_linear_kernel(
-    config: MPLinearLayerConfig, compute_capability: int | None = None
+    config: MPLinearLayerConfig,
+    compute_capability: int | None = None,
+    *,
+    required_kernel: type[MPLinearKernel] | None = None,
 ) -> type[MPLinearKernel]:
     """Choose an MPLinearKernel that can implement the given config for the given
      compute capability. Attempts to choose the best kernel in terms of
@@ -900,6 +903,7 @@ def choose_mp_linear_kernel(
         compute_capability (Optional[int], optional): The compute capability of
             the target device, if None uses `current_platform` to get
             the compute capability. Defaults to None.
+        required_kernel: Kernel required by explicit activation quantization.
 
     Raises:
         ValueError: If no kernel can implement the given config.
@@ -926,6 +930,14 @@ def choose_mp_linear_kernel(
     )
 
     failure_reasons = []
+    if required_kernel is not None:
+        if required_kernel not in platform_kernels:
+            raise ValueError(
+                f"The requested activation quantization requires "
+                f"{required_kernel.__name__}, which the selected backend does not "
+                "allow."
+            )
+        platform_kernels = [required_kernel]
     for kernel in platform_kernels:
         if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
             failure_reasons.append(
@@ -954,7 +966,7 @@ def choose_mp_linear_kernel(
 
     raise ValueError(
         "Failed to find a kernel that can implement the "
-        "WNA16 linear layer. Reasons: \n" + "\n".join(failure_reasons)
+        "mixed-precision linear layer. Reasons: \n" + "\n".join(failure_reasons)
     )
 
 

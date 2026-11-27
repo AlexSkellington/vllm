@@ -40,6 +40,44 @@ layers use CUTLASS. Per-quantization overrides take precedence over
 `--linear-backend`; schemes without an override continue to use the global
 setting, including automatic selection when it is `auto`.
 
+## Alex_C.T integer linears on RTX 3090
+
+The lab Humming fork provides SM86 integer Tensor Core kernels for packed
+compressed-tensors W4A4, W4A8, W5A8, W6A8, and W8A8 linear layers. W4A4 uses
+INT4 MMA. The INT8 modes consume packed weights and expand narrower weights
+inside GEMM. Weight precision comes from the checkpoint.
+
+To request integer activations for existing weight-only checkpoints, use
+`VLLM_HUMMING_INPUT_QUANT_CONFIG`. This example uses group-128 INT8 activation
+quantization with a grouped INT5 checkpoint.
+
+```bash
+VLLM_HUMMING_INPUT_QUANT_CONFIG='{"dtype":"int8","group_size":128}' \
+  vllm serve /path/to/packed-int5-model \
+  --kernel-config '{"linear_backend_per_quant":{"mixed_precision":"humming"}}'
+```
+
+Use `"dtype":"int4"` with symmetric INT4 weights for W4A4. Omit `group_size`
+for per-token activation scaling. Packed checkpoints can also declare dynamic
+integer activation quantization in their own metadata. Incompatible shapes
+or backends produce a load error for explicit integer paths. The Alex_C.T
+Humming build adds SM86 schedules for benchmarked
+projection shapes and support for symmetric nested 64/128 scale groups.
+
+The lab build also supports IQ4_NL and IQ4_XS with INT8 activations. The kernel
+looks up the exact signed IQ4_NL codebook levels in registers before INT8 MMA.
+For IQ4_XS, the loader consumes the same indices and the scale of each
+32-weight sub-block. `tools/as1/convert_iq4_tensor.py` exports those fields
+from GGUF for checkpoint assembly. Use `{"dtype":"int8"}` for per-token
+activation scales or `{"dtype":"int8","group_size":32}` for group scales.
+The model's parameter dtype determines the serving precision of the imported
+scales.
+
+`--kv-cache-dtype int8_per_token_head` and `--kv-cache-dtype int4_per_token_head`
+select the separate Triton attention kernels for integer KV storage. Compare
+these modes against the deployed attention backend at the same context length
+and speculative decoding settings before choosing a serving configuration.
+
 ## Supported Hardware
 
 The table below shows the compatibility of various quantization implementations with different hardware platforms in vLLM:

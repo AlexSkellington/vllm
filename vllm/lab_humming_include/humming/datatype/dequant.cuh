@@ -163,7 +163,7 @@ CUDA_INLINE void lutnl_dequant_x8(uint32_t q, uint32_t *res) {
 
 template <class SourceType, class TargetType, bool kHasZeroPoint = false, bool kIsFpZeroPoint = false, uint32_t kNumWarpShapeNSplits = 1>
 CUDA_INLINE void dequant(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
-  if constexpr (SourceType::kIsLut) {
+  if constexpr (SourceType::kIsLut && TargetType::kBits == 16) {
     static_assert(SourceType::kBits == 4 && TargetType::kBits == 16 && !kHasZeroPoint);
     if constexpr (SourceType::kLutId == 2) lutnl_dequant_x8<TargetType>(qb[j], res);
     else lut7_dequant_x8<TargetType>(qb[j], res);

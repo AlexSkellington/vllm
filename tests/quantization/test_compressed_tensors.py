@@ -40,6 +40,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8Mxfp8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsWNA4Int,
+    CompressedTensorsWNA8Int,
     CompressedTensorsWNA8O8Int,
     CompressedTensorsWNA16,
 )
@@ -749,6 +751,49 @@ _DYNAMIC_INT8_ACT = QuantizationArgs(
     symmetric=True,
     dynamic=True,
 )
+
+
+@pytest.mark.parametrize(
+    "weight_bits,activation_bits", [(4, 4), (4, 8), (5, 8), (6, 8), (8, 8)]
+)
+def test_packed_integer_activation_override(weight_bits, activation_bits, monkeypatch):
+    config = CompressedTensorsConfig({}, [], "pack-quantized")
+    weights = QuantizationArgs(num_bits=weight_bits, type="int", group_size=128)
+    monkeypatch.setenv(
+        "VLLM_HUMMING_INPUT_QUANT_CONFIG",
+        f'{{"dtype":"int{activation_bits}","group_size":128,'
+        '"dynamic":{"-:^model[.]holdout":{}}}',
+    )
+    scheme = config._get_scheme_from_parts(weights, None, layer_name="model.proj")
+    expected = (
+        CompressedTensorsWNA4Int if activation_bits == 4 else CompressedTensorsWNA8Int
+    )
+    assert type(scheme) is expected
+    assert scheme.input_quant.num_bits == activation_bits
+    assert scheme.input_quant.group_size == 128
+
+    holdout = config._get_scheme_from_parts(weights, None, layer_name="model.holdout")
+    assert type(holdout) is CompressedTensorsWNA16
+    explicit = config._get_scheme_from_parts(
+        weights, _DYNAMIC_INT8_ACT, layer_name="model.proj"
+    )
+    assert type(explicit) is CompressedTensorsWNA8Int
+    assert explicit.input_quant is _DYNAMIC_INT8_ACT
+
+
+@pytest.mark.parametrize("observer", ["lab_iq4nl", "lab_iq4xs"])
+def test_exact_iq4_codebook_keeps_indices_with_int8(observer, monkeypatch):
+    config = CompressedTensorsConfig({}, [], "pack-quantized")
+    weights = QuantizationArgs(
+        num_bits=4, type="int", group_size=32, observer=observer
+    )
+    monkeypatch.setenv(
+        "VLLM_HUMMING_INPUT_QUANT_CONFIG", '{"dtype":"int8","group_size":32}'
+    )
+    scheme = config._get_scheme_from_parts(weights, None, layer_name="model.proj")
+    assert isinstance(scheme, CompressedTensorsWNA8Int)
+    assert scheme.codebook == "iq4nl"
+    assert scheme.input_quant.group_size == 32
 
 
 @pytest.mark.parametrize(

@@ -160,11 +160,18 @@ def prepare_humming_linear_layer_config(
 
     # Step 1: convert weight and input schemas to humming standard format
     source_tensors = kernel_parameters(layer)
+    preserve_integer_weights = False
+    if input_quant_config is not None:
+        activation_dtype = input_schema.to_humming_schema(layer.params_dtype).a_dtype
+        preserve_integer_weights = (
+            activation_dtype is not None and activation_dtype.is_integer_type
+        )
     weight_schema, tensors = weight_schema.convert_humming(
         tensors=source_tensors,
         shape_n_stacks=shape_n_stacks,
         shape_k_stacks=shape_k_stacks,
         param_dtype=layer.params_dtype,
+        convert_symmetric_integer=not preserve_integer_weights,
     )
     input_schema, input_tensors = input_schema.convert_humming(
         tensors=source_tensors,

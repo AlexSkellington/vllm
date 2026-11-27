@@ -16,10 +16,13 @@ import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
+    QuantizationType,
 )
 
+from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    HummingLinearKernel,
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
 )
@@ -47,6 +50,7 @@ __all__ = ["CompressedTensorsWNA8Int"]
 
 
 class CompressedTensorsWNA8Int(CompressedTensorsScheme):
+    activation_bits = 8
     _kernel_backends_being_used: set[str] = set()
 
     def __init__(
@@ -58,7 +62,9 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         input_quant: QuantizationArgs | None = None,
         layer_name: str | None = None,
         quant_format: str = "pack-quantized",
+        codebook: str | None = None,
     ):
+        scheme_name = f"WNA{self.activation_bits}Int"
         self.num_bits = num_bits
         self.pack_factor = Fraction(32, num_bits)
         self.strategy = strategy
@@ -67,10 +73,20 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         self.input_quant = input_quant
         self.layer_name = layer_name
         self.quant_format = quant_format
+        self.codebook = codebook
+
+        if codebook is not None and (
+            codebook != "iq4nl"
+            or num_bits != 4
+            or not symmetric
+            or self.activation_bits != 8
+            or input_quant is None
+        ):
+            raise ValueError("Exact IQ4 codebook weights require symmetric W4A8")
 
         if num_bits not in WNA16_SUPPORTED_TYPES_MAP:
             raise ValueError(
-                f"Unsupported num_bits = {num_bits} for WNA8Int; "
+                f"Unsupported num_bits = {num_bits} for {scheme_name}; "
                 f"supported = {sorted(WNA16_SUPPORTED_TYPES_MAP)}"
             )
 
@@ -88,14 +104,24 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         )
 
         if input_quant is not None:
+            if (
+                input_quant.type != QuantizationType.INT
+                or input_quant.num_bits != self.activation_bits
+                or num_bits > self.activation_bits
+                or (num_bits == self.activation_bits and not symmetric)
+            ):
+                raise ValueError(
+                    f"Unsupported integer W{num_bits}A{self.activation_bits} "
+                    "weight and activation quantization combination."
+                )
             if not input_quant.symmetric:
                 raise ValueError(
-                    "WNA8Int requires symmetric activation quantization, "
+                    f"{scheme_name} requires symmetric activation quantization, "
                     f"got symmetric={input_quant.symmetric}"
                 )
             if not input_quant.dynamic:
                 raise ValueError(
-                    "WNA8Int requires dynamic activation quantization, "
+                    f"{scheme_name} requires dynamic activation quantization, "
                     f"got dynamic={input_quant.dynamic}"
                 )
             if input_quant.strategy not in (
@@ -103,7 +129,7 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
                 QuantizationStrategy.GROUP.value,
             ):
                 raise ValueError(
-                    "WNA8Int requires per-token or per-group activation "
+                    f"{scheme_name} requires per-token or per-group activation "
                     f"quantization, got strategy={input_quant.strategy}"
                 )
 
@@ -160,14 +186,19 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
             zero_points=not self.symmetric,
         )
 
-        kernel_type = choose_mp_linear_kernel(mp_config)
-        if kernel_type.__name__ not in self._kernel_backends_being_used:
-            logger.info("Using %s for CompressedTensorsWNA8Int", kernel_type.__name__)
-            self._kernel_backends_being_used.add(kernel_type.__name__)
-
         input_quant_config = self._build_input_quant_config()
+        kernel_type = choose_mp_linear_kernel(
+            mp_config,
+            required_kernel=HummingLinearKernel if input_quant_config else None,
+        )
+        signature = f"{kernel_type.__name__} W{self.num_bits}A{self.activation_bits}"
+        if signature not in self._kernel_backends_being_used:
+            logger.info("Using %s for packed integer linear layers", signature)
+            self._kernel_backends_being_used.add(signature)
         if input_quant_config is not None:
             layer._humming_input_quant_config = input_quant_config
+        if self.codebook is not None:
+            layer._lab_codebook = self.codebook
 
         # --- weight parameters ---
         group_size = self.group_size if self.group_size != -1 else input_size
@@ -177,7 +208,9 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         )
         scales_and_zp_size = input_size // group_size
         if partition_scales:
-            assert input_size_per_partition % group_size == 0
+            verify_group_size_divides_partition(
+                input_size_per_partition, group_size, self.layer_name
+            )
             scales_and_zp_size = input_size_per_partition // group_size
 
         packed_input_dim = math.ceil(input_size_per_partition * self.num_bits / 32)

@@ -150,8 +150,21 @@ CUDA_INLINE uint32_t lut7_to_f16(uint32_t val) {
 template <class SourceType, class TargetType, bool kHasZeroPoint, bool kIsFpZeroPoint>
 CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
   if constexpr (SourceType::kIsLut) {
-    static_assert(TargetType::kIsFloatingPointType && TargetType::kBits == 16 && !kHasZeroPoint);
-    return lut7_to_f16<TargetType>(val);
+    static_assert(!kHasZeroPoint);
+    if constexpr (std::is_same<TargetType, Int8>::value) {
+      static_assert(SourceType::kLutId == 2);
+      // Gather the four nibble selectors from the byte lanes. Each output byte
+      // is the exact signed IQ4_NL level in the order expected by INT8 MMA.
+      const uint32_t indices = (val & 0xFu) | ((val >> 4) & 0xF0u)
+                               | ((val >> 8) & 0xF00u) | ((val >> 12) & 0xF000u);
+      const uint32_t low_indices = indices & 0x7777u;
+      const uint32_t low = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, low_indices);
+      const uint32_t high = __byte_perm(0x26190D01u, 0x71594535u, low_indices);
+      return __byte_perm(low, high, 0x3210u | ((indices & 0x8888u) >> 1));
+    } else {
+      static_assert(TargetType::kIsFloatingPointType && TargetType::kBits == 16);
+      return lut7_to_f16<TargetType>(val);
+    }
   } else
   if constexpr (std::is_same<SourceType, TargetType>::value) {
     static_assert(!kHasZeroPoint);

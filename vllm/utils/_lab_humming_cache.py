@@ -78,6 +78,9 @@ def install() -> None:
     if has_lab:
         comp.include_dirs = staticmethod(lambda: [LAB_INC, inc])
         _register_codebook_dtypes()
+        from vllm.utils import _lab_humming_sm86
+
+        _lab_humming_sm86.install()
     if os.environ.get("LAB_HUMMING_STABLE_CACHE", "1") == "0":
         return
 

@@ -14,6 +14,7 @@ from compressed_tensors.quantization import (
 )
 from compressed_tensors.transform import TransformConfig
 
+from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -64,6 +65,10 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.humming.schema import (
+    humming_is_layer_skipped,
+    resolve_humming_layer_config,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -84,6 +89,11 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, QuantizationArgs] | None]
+_LAB_CODEBOOKS = {
+    "lab_iq4nl": "iq4nl",
+    "lab_iq4xs": "iq4nl",
+    "lab_iq4nl7": "iq4nl7",
+}
 
 
 class CompressedTensorsConfig(QuantizationConfig):
@@ -696,7 +706,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @staticmethod
     def _is_wNa16_group_channel(
-        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs | None
     ) -> bool:
         input_quant_none = input_quant is None
         is_channel_group = (
@@ -783,13 +793,43 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self,
         weight_quant: QuantizationArgs,
-        input_quant: QuantizationArgs,
+        input_quant: QuantizationArgs | None,
         output_quant: QuantizationArgs | None = None,
         format: str | None = None,
         layer_name: str | None = None,
     ) -> "CompressedTensorsScheme":
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format
+        codebook = _LAB_CODEBOOKS.get(weight_quant.observer)
+
+        # Apply an explicit integer activation request to existing packed weights.
+        # Explicit checkpoint activation metadata keeps precedence.
+        if (
+            input_quant is None
+            and output_quant is None
+            and format == CompressionFormat.pack_quantized.value
+            and weight_quant.type == QuantizationType.INT
+            and self._is_wNa16_group_channel(weight_quant, None)
+            and codebook != "iq4nl7"
+        ):
+            override = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG
+            prefix = layer_name or ""
+            if override and not humming_is_layer_skipped(override, prefix):
+                config = resolve_humming_layer_config(override, prefix)
+                dtype = config.get("dtype")
+                if dtype in ("int4", "int8"):
+                    group_size = config.get("group_size", 0)
+                    input_quant = QuantizationArgs(
+                        num_bits=int(dtype[3:]),
+                        type=QuantizationType.INT,
+                        strategy=(
+                            QuantizationStrategy.GROUP if group_size
+                            else QuantizationStrategy.TOKEN
+                        ),
+                        group_size=group_size or None,
+                        symmetric=True,
+                        dynamic=True,
+                    )
 
         # Detect If Mixed Precision
         if self._is_nvfp4_format(weight_quant):
@@ -836,23 +876,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
 
         if (
-            self._is_wNaM_int(weight_quant, input_quant, format)
-            and input_quant.num_bits == 8
+            input_quant is not None
+            and input_quant.num_bits in (4, 8)
+            and self._is_wNaM_int(weight_quant, input_quant, format)
         ):
-            return CompressedTensorsWNA8Int(
-                num_bits=weight_quant.num_bits,
-                strategy=weight_quant.strategy,
-                group_size=weight_quant.group_size,
-                symmetric=weight_quant.symmetric,
-                input_quant=input_quant,
-                layer_name=layer_name,
-                quant_format=format,
+            scheme = (
+                CompressedTensorsWNA4Int if input_quant.num_bits == 4
+                else CompressedTensorsWNA8Int
             )
-        if (
-            self._is_wNaM_int(weight_quant, input_quant, format)
-            and input_quant.num_bits == 4
-        ):
-            return CompressedTensorsWNA4Int(
+            return scheme(
                 num_bits=weight_quant.num_bits,
                 strategy=weight_quant.strategy,
                 group_size=weight_quant.group_size,
@@ -860,6 +892,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 input_quant=input_quant,
                 layer_name=layer_name,
                 quant_format=format,
+                codebook=codebook,
             )
 
         if self._is_wNa16_group_channel(weight_quant, input_quant) and (
@@ -871,8 +904,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 symmetric=weight_quant.symmetric,
                 group_size=weight_quant.group_size,
                 layer_name=layer_name,
-                # lab (AS1 2026-11-22): 4-bit codebook indices for the lab Humming Iq4nl7Type kernel
-                codebook={"lab_iq4nl": "iq4nl", "lab_iq4nl7": "iq4nl7"}.get(getattr(weight_quant, "observer", None)),
+                codebook=codebook,
             )
 
         act_quant_format = is_activation_quantization_format(format)

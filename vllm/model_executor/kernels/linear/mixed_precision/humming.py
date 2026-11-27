@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Humming GEMM as a mixed-precision WNA16Int linear kernel."""
+"""Humming GEMM for mixed-precision integer linear layers."""
 
 import torch
 
@@ -72,6 +72,7 @@ class HummingLinearKernel(MPLinearKernel):
             quant_config,
             input_quant_config=input_quant_config,
             input_schema=input_schema,
+            allow_input_schema_fallback=input_quant_config is None,
         )
         self.compute_config = get_humming_linear_compute_config()
         self.locks = create_humming_locks(layer.weight.device)
