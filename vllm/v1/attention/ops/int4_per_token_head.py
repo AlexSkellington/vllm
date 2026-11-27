@@ -26,7 +26,9 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_kv_seq_mask,
     compute_tile_loop_bounds,
     init_softmax_M,
+    lab_integer_qk_enabled,
     load_qq_bias_tile,
+    quantize_query_i8,
     resolve_seq_and_query_len,
     softmax_step,
     store_segm_reduce_scalars,
@@ -384,6 +386,7 @@ def _attn_packed(
     # 2 → INT4 nibble pair (asymmetric + zp).  The packed KV cache stores
     # one byte per ``packed_offs``, holding PACKING_FACTOR values.
     PACKING_FACTOR: tl.constexpr,
+    USE_INTEGER_QK: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -449,8 +452,19 @@ def _attn_packed(
         other=0.0,
     ).to(tl.float32)
 
-    # INT4 asymmetric correction needs sum(Q) per row.
-    Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
+    # The asymmetric correction uses the same query values as the dot product.
+    if USE_INTEGER_QK:
+        magnitude = tl.maximum(
+            tl.max(tl.abs(Q_s0), axis=1), tl.max(tl.abs(Q_s1), axis=1)
+        )
+        Q_s0_int8, q_scale = quantize_query_i8(Q_s0, magnitude)
+        Q_s1_int8, _ = quantize_query_i8(Q_s1, magnitude)
+        Q_sum = (
+            tl.sum(Q_s0_int8.to(tl.int32), axis=1)
+            + tl.sum(Q_s1_int8.to(tl.int32), axis=1)
+        ).to(tl.float32)
+    else:
+        Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -525,8 +539,9 @@ def _attn_packed(
         # Dequantize KV.  INT4 unpacks nibbles as plain uint [0..15];
         # the zero-point is applied on the score side.
         K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
-        K_s0 = K_s0_u.to(tl.float32)
-        K_s1 = K_s1_u.to(tl.float32)
+        if not USE_INTEGER_QK:
+            K_s0 = K_s0_u.to(tl.float32)
+            K_s1 = K_s1_u.to(tl.float32)
         V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
         V_s0 = V_s0_u.to(tl.float32)
         V_s1 = V_s1_u.to(tl.float32)
@@ -569,10 +584,16 @@ def _attn_packed(
         # softmax_scale * per-(token, head) k_scale in one mul.  INT4
         # subtracts the ``zp * sum(Q)`` correction term.
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
-        S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
-            scale * k_token_head_scales[None, :]
-        )
+        if USE_INTEGER_QK:
+            raw_dot = (
+                tl.dot(Q_s0_int8, K_s0_u.to(tl.int8), out_dtype=tl.int32)
+                + tl.dot(Q_s1_int8, K_s1_u.to(tl.int8), out_dtype=tl.int32)
+            ).to(tl.float32)
+            centered = (raw_dot - Q_sum[:, None] * k_zp[None, :]) * q_scale[:, None]
+        else:
+            raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
+            centered = raw_dot - Q_sum[:, None] * k_zp[None, :]
+        S += centered * (scale * k_token_head_scales[None, :])
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -823,6 +844,9 @@ def _launch_packed_attn(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         PACKING_FACTOR=packing_factor,
+        USE_INTEGER_QK=(
+            not is_batch_invariant and lab_integer_qk_enabled(q, max_seqlen_q)
+        ),
     )
 
     if use_3d:

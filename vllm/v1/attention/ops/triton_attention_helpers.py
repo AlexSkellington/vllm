@@ -11,11 +11,36 @@ kernel (and any future consumer) share a single implementation.
 
 from __future__ import annotations
 
+import os
+
+import torch
+
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # ===========================================================================
 # Scalar helpers (reused by every kernel + reduce_segments)
 # ===========================================================================
+
+
+def lab_integer_qk_enabled(query: torch.Tensor, max_query_length: int) -> bool:
+    """Use the lab INT8 score path for large SM86 prefill batches."""
+    return (
+        os.getenv("LAB_INTEGER_KV_QK") == "1"
+        and max_query_length >= 64
+        and query.shape[-1] >= 64
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and current_platform.is_cuda()
+        and current_platform.get_device_capability(query.device.index) == (8, 6)
+    )
+
+
+@triton.jit
+def quantize_query_i8(query, magnitude):
+    """Quantize with an FP32 scale for each query row."""
+    scale = tl.maximum(magnitude * (1.0 / 127.0), 1.0e-12)
+    values = tl.extra.cuda.libdevice.rint(query.to(tl.float32) / scale[:, None])
+    return tl.clamp(values, -127.0, 127.0).to(tl.int8), scale
 
 
 @triton.jit

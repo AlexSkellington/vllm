@@ -74,9 +74,14 @@ The model's parameter dtype determines the serving precision of the imported
 scales.
 
 `--kv-cache-dtype int8_per_token_head` and `--kv-cache-dtype int4_per_token_head`
-select the separate Triton attention kernels for integer KV storage. Compare
-these modes against the deployed attention backend at the same context length
-and speculative decoding settings before choosing a serving configuration.
+select the Triton attention kernels for integer KV storage. With either cache
+format, `LAB_INTEGER_KV_QK=1` enables the Alex_C.T SM86 INT8 query–key path
+for prefill with at least 64 query tokens and head dimensions of at least 64.
+It quantizes each query row and accumulates the query–key dot product in INT32.
+Softmax and value accumulation use the regular precision for that cache
+format. The flag is opt-in because it changes prefill numerics. Compare these
+modes against the deployed attention backend at the same context length and
+speculative decoding settings before choosing a serving configuration.
 
 ## Supported Hardware
 

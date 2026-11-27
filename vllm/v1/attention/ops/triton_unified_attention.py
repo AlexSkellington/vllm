@@ -23,7 +23,9 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_tile_loop_bounds,
     find_seq_idx,
     init_softmax_M,
+    lab_integer_qk_enabled,
     load_qq_bias_tile,
+    quantize_query_i8,
     resolve_seq_and_query_len,
     softmax_step,
     store_segm_reduce_scalars,
@@ -274,6 +276,7 @@ def kernel_unified_attention(
     # FP8_PER_TOKEN_HEAD (3). Sub-byte INT4 (4) uses its own
     # int4_per_token_head kernel, not this one.
     KV_QUANT_MODE: tl.constexpr = 0,
+    USE_INTEGER_QK: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     # Chunked / block-local attention.  ``CHUNK_LOOKBACK >= 0`` enables
@@ -373,6 +376,10 @@ def kernel_unified_attention(
             mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             other=0.0,
         )
+
+    if USE_INTEGER_QK:
+        query_max = tl.max(tl.abs(Q.to(tl.float32)), axis=1)
+        query_int8, query_int8_scale = quantize_query_i8(Q, query_max)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -496,7 +503,8 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if not USE_INTEGER_QK:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
@@ -541,7 +549,14 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if USE_INTEGER_QK:
+            qk = tl.dot(query_int8, K_load, out_dtype=tl.int32).to(tl.float32)
+            S += (
+                qk
+                * query_int8_scale[:, None]
+                * (score_scale * k_token_head_scales[None, :])
+            )
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -1198,6 +1213,11 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
+        USE_INTEGER_QK=(
+            kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and not is_batch_invariant
+            and lab_integer_qk_enabled(q, max_seqlen_q)
+        ),
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
