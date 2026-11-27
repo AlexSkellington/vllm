@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     set_triton_ptr_range,
 )
+from vllm.v1.attention.ops.triton_attention_helpers import lab_int4_kv_split_k_enabled
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -163,10 +164,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         headdim_padded = next_power_of_2(self.headdim)
         max_query_len_3d = 1
         speculative_config = vllm_config.speculative_config
-        # The INT4 launcher runs multi-query batches in 2D only.
-        if (
-            speculative_config is not None
-            and kv_cache_spec.kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
+        if speculative_config is not None and (
+            kv_cache_spec.kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
+            or lab_int4_kv_split_k_enabled(device)
         ):
             num_speculative_tokens = speculative_config.num_speculative_tokens or 0
             query_len = 1 + num_speculative_tokens * (

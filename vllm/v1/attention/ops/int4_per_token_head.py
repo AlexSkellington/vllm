@@ -26,6 +26,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_kv_seq_mask,
     compute_tile_loop_bounds,
     init_softmax_M,
+    lab_int4_kv_split_k_enabled,
     lab_integer_qk_enabled,
     load_qq_bias_tile,
     quantize_query_i8,
@@ -422,7 +423,9 @@ def _attn_packed(
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
 
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m < BLOCK_Q * num_queries_per_kv
+    )
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Split-Q prologue: PACKING_FACTOR interleaved streams of Q.
@@ -722,7 +725,10 @@ def _launch_packed_attn(
     into ``out`` (directly for 2D; via the segm buffers for 3D).
     """
     import vllm.envs as envs
-    from vllm.v1.attention.ops.triton_unified_attention import _get_tile_size
+    from vllm.v1.attention.ops.triton_unified_attention import (
+        MAX_3D_QUERY_LEN,
+        _get_tile_size,
+    )
 
     is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
@@ -761,8 +767,16 @@ def _launch_packed_attn(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or softmax_segm_max.shape[0] < q.shape[0]
+        or (
+            max_seqlen_q > 1
+            and (
+                max_seqlen_q > MAX_3D_QUERY_LEN
+                or use_mm_prefix
+                or not lab_int4_kv_split_k_enabled(q.device)
+            )
+        )
+        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
         or is_batch_invariant
     )
 

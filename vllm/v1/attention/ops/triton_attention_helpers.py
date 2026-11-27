@@ -35,6 +35,15 @@ def lab_integer_qk_enabled(query: torch.Tensor, max_query_length: int) -> bool:
     )
 
 
+def lab_int4_kv_split_k_enabled(device: torch.device) -> bool:
+    """Allow speculative verification to split the packed KV scan on SM86."""
+    return (
+        os.getenv("LAB_INT4_KV_SPLIT_K") == "1"
+        and current_platform.is_cuda()
+        and current_platform.get_device_capability(device.index) == (8, 6)
+    )
+
+
 @triton.jit
 def quantize_query_i8(query, magnitude):
     """Quantize with an FP32 scale for each query row."""

@@ -82,6 +82,9 @@ Softmax and value accumulation use the regular precision for that cache
 format. The flag is opt-in because it changes prefill numerics. Compare these
 modes against the deployed attention backend at the same context length and
 speculative decoding settings before choosing a serving configuration.
+`LAB_INT4_KV_SPLIT_K=1` enables split-K for small speculative verification
+batches using packed INT4 KV on SM86. It parallelizes the cache scan across
+segments and combines their softmax statistics before writing the output.
 
 ## Supported Hardware
 
