@@ -69,6 +69,9 @@ VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 # written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
 # wakeup stays negligible (one flag check per reader every 5s).
 SHM_READER_RECHECK_INTERVAL_MS = 5000
+# A busy reader needs a shorter recovery interval when it starts parking
+# between recent messages. Notifications are advisory; the ring is authoritative.
+SHM_ACTIVE_RECHECK_INTERVAL_MS = 2
 # How often a busy reader polls its notify socket. CONFLATE keeps one message,
 # but libzmq still queues an internal command per notification until the socket
 # is polled, so a reader that never goes idle would grow without bound.
@@ -150,6 +153,7 @@ class SpinCondition:
 
             # Time to keep busy-looping on the shm buffer before going idle
             self.busy_loop_s = busy_loop_s
+            self.spin_limit_s = envs.VLLM_SHM_READER_SPIN_US / 1_000_000
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)
@@ -206,18 +210,19 @@ class SpinCondition:
     def wait(self, timeout_ms: int | None = None) -> None:
         """Wait for data on the shared memory buffer.
 
-        Yields the scheduler then returns immediately if it has been less than
-        self.busy_loop_s since the last read.
-
-        Otherwise, enters idle mode and awaits a socket ping for at most
-        `timeout_ms` milliseconds, or indefinitely if timeout_ms is None.
+        Yield during the configured spin window. Afterwards, wait for a socket
+        notification and recheck the ring more frequently for recent readers.
         """
         assert self.is_reader, "Only readers can wait"
 
-        current_time = time.monotonic()
-        if current_time <= self.last_read + self.busy_loop_s:
+        since_read = time.monotonic() - self.last_read
+        if since_read <= min(self.busy_loop_s, self.spin_limit_s):
             sched_yield()
         else:
+            if since_read <= self.busy_loop_s and (
+                timeout_ms is None or timeout_ms > SHM_ACTIVE_RECHECK_INTERVAL_MS
+            ):
+                timeout_ms = SHM_ACTIVE_RECHECK_INTERVAL_MS
             events = dict(self.poller.poll(timeout=timeout_ms))
 
             if self.read_cancel_socket in events:

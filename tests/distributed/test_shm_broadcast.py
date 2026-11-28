@@ -589,6 +589,34 @@ def test_reader_timeout_caps_indefinite_waits(should_warn):
         assert timeout.timeout_ms() == 7
 
 
+def test_short_spin_budget_bounds_active_reader_poll(monkeypatch):
+    monkeypatch.setenv("VLLM_SHM_READER_SPIN_US", "250")
+    clock = mock.Mock(return_value=10.0)
+    yield_cpu = mock.Mock()
+    with (
+        mock.patch.object(shm_broadcast.time, "monotonic", clock),
+        mock.patch.object(shm_broadcast, "sched_yield", yield_cpu),
+        mock.patch.object(shm_broadcast.zmq, "Poller"),
+        mock.patch.object(shm_broadcast, "get_open_zmq_inproc_path"),
+    ):
+        condition = shm_broadcast.SpinCondition(True, mock.Mock(), "notify")
+        clock.return_value = 10.0001
+        condition.wait(timeout_ms=5000)
+        yield_cpu.assert_called_once()
+        condition.poller.poll.assert_not_called()
+
+        condition.poller.poll.return_value = []
+        clock.return_value = 10.01
+        condition.wait(timeout_ms=5000)
+        condition.poller.poll.assert_called_once_with(timeout=2)
+        condition.wait(timeout_ms=1)
+        condition.poller.poll.assert_called_with(timeout=1)
+
+        clock.return_value = 11.01
+        condition.wait(timeout_ms=5000)
+        condition.poller.poll.assert_called_with(timeout=5000)
+
+
 def test_reader_rechecks_shm_after_idle_wait_timeout_without_notify():
     writer = MessageQueue(
         n_reader=1,

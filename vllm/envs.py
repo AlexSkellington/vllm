@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_USE_FASTOKENS: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_SHM_READER_SPIN_US: int = 1_000_000
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -2361,6 +2362,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    # Bound the Python shared-memory reader's busy wait before polling for
+    # a notification. This setting does not affect the native spin extension.
+    "VLLM_SHM_READER_SPIN_US": lambda: max(
+        0, int(os.getenv("VLLM_SHM_READER_SPIN_US", "1000000"))
+    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
@@ -2462,6 +2468,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+        "VLLM_SHM_READER_SPIN_US",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",

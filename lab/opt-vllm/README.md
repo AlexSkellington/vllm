@@ -215,3 +215,11 @@ restarts. `--max-num-seqs 64` keeps the KV pool at 552,587 (2.1x 262k). Drop-in 
 stale /dev/shm/vllm_offload_*.mmap before each start (a leftover one made the engine crash-loop). The fs tier never deletes:
 vllm-kvcache-trim.timer (10 min) evicts least-recently-read chunk files above 90% of the dataset, down to 85%.
 Rollback: restore vllm-engine.sh.bak-pre-kvoff-*, remove the drop-in, disable the timer.
+
+### Shared-memory worker waits
+
+`VLLM_SHM_READER_SPIN_US` sets the Python reader spin budget in microseconds.
+With a shorter budget, a recent reader waits for ZeroMQ notifications and
+caps each active wait at 2 ms before rechecking the shared-memory ring.
+Idle readers keep the existing recheck interval. The default is 1,000,000 µs, and the
+separate native spin extension keeps its own settings.
