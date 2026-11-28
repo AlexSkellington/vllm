@@ -28,7 +28,7 @@ def check(ipc, device, calls):
         view = x[:size]
         ref = ar.all_reduce(comm, view)
         actual = ar.all_reduce(comm, view, ipc)
-        assert torch.equal(actual, ref), size
+        assert torch.equal(actual, ref), (size, (actual - ref).abs().max().item())
         expected[size] = ref[:32].clone()
     streams = [torch.cuda.Stream(device=device) for _ in range(2)]
     main = torch.cuda.current_stream(device)

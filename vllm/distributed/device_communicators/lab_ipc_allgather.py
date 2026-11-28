@@ -81,7 +81,7 @@ class LabIpcAllGather:
             )
             self.disabled = True
             return
-        local_handle = None
+        layout = None
         try:
             self.max_payload = int(os.environ.get("LAB_AR_IPC_MAX_MB", "32")) << 20
             if self.device.type == "cuda" and self.max_payload > 0:
@@ -92,22 +92,31 @@ class LabIpcAllGather:
                 self.own_flag = self.own_buf[-FLAG_BYTES:].view(torch.uint64)
                 self.own_flag.zero_()
                 torch.cuda.current_stream(self.device).synchronize()
-                _, args = reduce_tensor(self.own_buf)
-                local_handle = (slot, args)
+                layout = slot
+        except (TypeError, ValueError, RuntimeError):
+            logger.exception("lab IPC all-gather could not allocate local storage")
+        gathered: list = [None] * 2
+        dist.all_gather_object(gathered, layout, group=cpu_group)
+        if any(slot is None or slot != self.max_payload for slot in gathered):
+            self._disable()
+            return
+
+        local_handle = None
+        try:
+            _, local_handle = reduce_tensor(self.own_buf)
         except (TypeError, ValueError, RuntimeError):
             logger.exception("lab IPC all-gather could not export local storage")
-        gathered: list = [None] * 2
         dist.all_gather_object(gathered, local_handle, group=cpu_group)
-        if any(handle is None or handle[0] != self.max_payload for handle in gathered):
+        if any(handle is None for handle in gathered):
             self._disable()
             return
 
         mapped = False
         try:
-            peer_args = list(gathered[1 - rank][1])
+            peer_args = list(gathered[1 - rank])
             # CUDA IPC storage must be opened in the receiving device context.
             # Reuse the local handle's encoded device for rebuild_cuda_tensor.
-            peer_args[6] = gathered[rank][1][6]
+            peer_args[6] = local_handle[6]
             with torch.cuda.device(self.device):
                 self.peer_buf = rebuild_cuda_tensor(*peer_args)
                 self.peer_flag = self.peer_buf[-FLAG_BYTES:].view(torch.uint64)

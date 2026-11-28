@@ -63,6 +63,17 @@ def _quant_kernel(
 
 
 @triton.jit
+def _dequant_accumulate(q, scale, acc, MODE: tl.constexpr):
+    v = q * (scale * (1.0 / 127.0))[:, None]
+    # Explicit contraction preserves the same rank order for either transport.
+    if MODE == 1:
+        return tl.fma(v, tl.abs(v), acc)
+    if MODE == 2:
+        return tl.fma(v * v, v, acc)
+    return acc + v
+
+
+@triton.jit
 def _dequant_sum_kernel(
     q_ptr,
     s_ptr,
@@ -84,12 +95,7 @@ def _dequant_sum_kernel(
             tl.float32
         )
         s = tl.load(s_ptr + r * s_stride + g, mask=gm, other=0.0).to(tl.float32)
-        v = q * (s * (1.0 / 127.0))[:, None]
-        if MODE == 1:
-            v = v * tl.abs(v)
-        if MODE == 2:
-            v = v * v * v
-        acc += v
+        acc = _dequant_accumulate(q, s, acc, MODE)
     tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=gm[:, None])
 
 
@@ -113,20 +119,10 @@ def _dequant_sum2_kernel(
     offs = g[:, None] * G + tl.arange(0, G)[None, :]
     q = tl.load(q0_ptr + offs, mask=gm[:, None], other=0).to(tl.float32)
     s = tl.load(s0_ptr + g, mask=gm, other=0.0).to(tl.float32)
-    v = q * (s * (1.0 / 127.0))[:, None]
-    if MODE == 1:
-        v = v * tl.abs(v)
-    if MODE == 2:
-        v = v * v * v
-    acc = v
+    acc = _dequant_accumulate(q, s, tl.zeros((R, G), dtype=tl.float32), MODE)
     q = tl.load(q1_ptr + offs, mask=gm[:, None], other=0).to(tl.float32)
     s = tl.load(s1_ptr + g, mask=gm, other=0.0).to(tl.float32)
-    v = q * (s * (1.0 / 127.0))[:, None]
-    if MODE == 1:
-        v = v * tl.abs(v)
-    if MODE == 2:
-        v = v * v * v
-    acc += v
+    acc = _dequant_accumulate(q, s, acc, MODE)
     tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=gm[:, None])
 
 
