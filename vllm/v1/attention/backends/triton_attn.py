@@ -35,7 +35,10 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     set_triton_ptr_range,
 )
-from vllm.v1.attention.ops.triton_attention_helpers import lab_int4_kv_split_k_enabled
+from vllm.v1.attention.ops.triton_attention_helpers import (
+    lab_int4_kv_split_k_enabled,
+    lab_int8_kv_tuned_enabled,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -154,13 +157,21 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # 64. This counts requests, not Q blocks, on purpose: for 1..11 verify
         # requests (K=3/5, 8 q / 1 KV head, 2k-128k context) 64 segments were
         # faster or within 6% at 2k, and 1.1-3.6x faster from 8k up.
-        self.max_seqs_64_segments = 0
+        self.max_seqs_more_segments = 0
+        extra_segments = NUM_PAR_SOFTMAX_SEGMENTS
         if current_platform.is_cuda() and current_platform.is_device_capability(
             (12, 0)
         ):
-            self.max_seqs_64_segments = (current_platform.num_compute_units() - 1) // (
-                NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv
-            )
+            extra_segments = 64
+        elif (
+            kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and lab_int8_kv_tuned_enabled(device, self.headdim)
+        ):
+            extra_segments = 32
+        if extra_segments > NUM_PAR_SOFTMAX_SEGMENTS:
+            self.max_seqs_more_segments = (
+                current_platform.num_compute_units() - 1
+            ) // (NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv)
         headdim_padded = next_power_of_2(self.headdim)
         max_query_len_3d = 1
         speculative_config = vllm_config.speculative_config
@@ -178,11 +189,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             self.seq_threshold_3D, vllm_config.scheduler_config.max_num_seqs
         )
         max_num_tokens_3d = max_num_seqs_3d * max_query_len_3d
-        if self.max_seqs_64_segments > 0:
-            self.num_par_softmax_segments = 64
+        if self.max_seqs_more_segments > 0:
+            self.num_par_softmax_segments = extra_segments
             # build() reuses this scratch at 16 segments with proportionally more rows.
             max_num_tokens_3d = max(
-                min(self.max_seqs_64_segments, max_num_seqs_3d) * max_query_len_3d,
+                min(self.max_seqs_more_segments, max_num_seqs_3d) * max_query_len_3d,
                 cdiv(
                     max_num_tokens_3d,
                     self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS,
@@ -261,11 +272,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
         )
-        if self.max_seqs_64_segments > 0 and (
-            self.max_seqs_64_segments < seq_lens.shape[0]
+        if self.max_seqs_more_segments > 0 and (
+            self.max_seqs_more_segments < seq_lens.shape[0]
             or self.softmax_segm_max.shape[0] < num_actual_tokens
         ):
-            # The 16-segment grid fills the SMs, or the 64-segment rows cannot
+            # The 16-segment grid fills the SMs, or the wider scratch cannot
             # hold every query token: same scratch, 16-segment layout.
             segments = NUM_PAR_SOFTMAX_SEGMENTS
             attn_metadata.num_par_softmax_segments = segments

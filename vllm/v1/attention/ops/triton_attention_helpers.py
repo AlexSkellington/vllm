@@ -15,6 +15,7 @@ import os
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -39,6 +40,16 @@ def lab_int4_kv_split_k_enabled(device: torch.device) -> bool:
     """Allow speculative verification to split the packed KV scan on SM86."""
     return (
         os.getenv("LAB_INT4_KV_SPLIT_K") == "1"
+        and current_platform.is_cuda()
+        and current_platform.get_device_capability(device.index) == (8, 6)
+    )
+
+
+def lab_int8_kv_tuned_enabled(device: torch.device, head_size: int) -> bool:
+    return (
+        envs.VLLM_LAB_INT8_KV_TUNED
+        and not envs.VLLM_BATCH_INVARIANT
+        and head_size == 256
         and current_platform.is_cuda()
         and current_platform.get_device_capability(device.index) == (8, 6)
     )

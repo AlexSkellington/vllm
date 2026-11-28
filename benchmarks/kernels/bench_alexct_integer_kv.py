@@ -46,30 +46,32 @@ def make_cache(bits, length, block, heads, dim):
     return k_cache, v_cache, k_scale, v_scale
 
 
-def run(length, rows, dim, split_k):
+def run(length, rows, dim, split_k, tuned_int8):
     torch.manual_seed(2026)
-    block, kv_heads, query_heads = 32, 2, 12 if split_k else 8
-    block_table = torch.arange(length // block, device="cuda", dtype=torch.int32)[
-        None, :
-    ]
+    block = 1584 if tuned_int8 else 32
+    kv_heads, query_heads = 2, 12 if split_k or tuned_int8 else 8
+    num_blocks = math.ceil(length / block)
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32)[None, :]
     for bits, mode in (
         (4, KVQuantMode.INT4_PER_TOKEN_HEAD),
         (8, KVQuantMode.INT8_PER_TOKEN_HEAD),
     ):
-        if split_k and bits != 4:
+        if (split_k and bits != 4) or (tuned_int8 and bits != 8):
             continue
-        k, v, k_scale, v_scale = make_cache(bits, length, block, kv_heads, dim)
+        k, v, k_scale, v_scale = make_cache(
+            bits, num_blocks * block, block, kv_heads, dim
+        )
         for m in rows:
             query = torch.randn(
                 (m, query_heads, dim), device="cuda", dtype=torch.bfloat16
             )
             out = torch.empty_like(query)
-            split_options = {}
-            if split_k:
-                segment_shape = (m, query_heads, 16)
-                split_options = dict(
+
+            def split_options(split, rows=m):
+                segment_shape = (rows, query_heads, split)
+                return dict(
                     seq_threshold_3D=64,
-                    num_par_softmax_segments=16,
+                    num_par_softmax_segments=split,
                     softmax_segm_output=torch.empty(
                         (*segment_shape, dim), device="cuda", dtype=torch.float32
                     ),
@@ -80,6 +82,7 @@ def run(length, rows, dim, split_k):
                         segment_shape, device="cuda", dtype=torch.float32
                     ),
                 )
+
             call = partial(
                 unified_attention,
                 query,
@@ -101,24 +104,31 @@ def run(length, rows, dim, split_k):
                 kv_quant_mode=mode,
                 k_scale_cache=k_scale,
                 v_scale_cache=v_scale,
-                **split_options,
             )
 
-            option = "LAB_INT4_KV_SPLIT_K" if split_k else "LAB_INTEGER_KV_QK"
+            variants = ({}, {})
+            if split_k:
+                variants = (split_options(16),) * 2
+            elif tuned_int8 and m <= 8:
+                variants = (split_options(16), split_options(32))
+            if tuned_int8:
+                option = "VLLM_LAB_INT8_KV_TUNED"
+            else:
+                option = "LAB_INT4_KV_SPLIT_K" if split_k else "LAB_INTEGER_KV_QK"
 
-            def invoke(enabled, function=call, env_var=option):
-                os.environ[env_var] = enabled
-                function()
+            def invoke(enabled, function=call, env_var=option, options=variants):
+                os.environ[env_var] = str(enabled)
+                function(**options[enabled])
 
-            invoke("0")
+            invoke(0)
             reference = out.float()
-            invoke("1")
+            invoke(1)
             error = ((out.float() - reference).norm() / reference.norm()).item()
-            if (split_k and m == 1) or (not split_k and m < 64):
+            if (split_k and m == 1) or (not split_k and not tuned_int8 and m < 64):
                 assert error == 0
             tolerance = 0.005 if split_k else 0.025
             assert error < tolerance, (bits, m, error)
-            control, trial = time_graphs([partial(invoke, "0"), partial(invoke, "1")])
+            control, trial = time_graphs([partial(invoke, 0), partial(invoke, 1)])
             print(
                 json.dumps(
                     dict(
@@ -141,8 +151,10 @@ if __name__ == "__main__":
     parser.add_argument("--length", type=int, default=8192)
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 128, 512, 2048])
-    parser.add_argument("--split-k", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--split-k", action="store_true")
+    mode.add_argument("--int8-tuned", action="store_true")
     args = parser.parse_args()
     if args.split_k and not all(1 <= m <= 8 for m in args.rows):
         parser.error("--split-k requires --rows within 1 to 8")
-    run(args.length, args.rows, args.dim, args.split_k)
+    run(args.length, args.rows, args.dim, args.split_k, args.int8_tuned)

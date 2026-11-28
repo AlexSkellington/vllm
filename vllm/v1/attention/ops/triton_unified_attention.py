@@ -23,6 +23,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_tile_loop_bounds,
     find_seq_idx,
     init_softmax_M,
+    lab_int8_kv_tuned_enabled,
     lab_integer_qk_enabled,
     load_qq_bias_tile,
     quantize_query_i8,
@@ -351,7 +352,7 @@ def kernel_unified_attention(
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_0 = offs_m // num_queries_per_kv < q_block_local_len
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -436,7 +437,9 @@ def kernel_unified_attention(
         tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=tile_mask,
+            other=0,
         ).to(tl.int64)
 
         if USE_TD:
@@ -1022,6 +1025,15 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+    tuned_int8_kv = (
+        kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and lab_int8_kv_tuned_enabled(q.device, head_size)
+    )
+    if tuned_int8_kv:
+        TILE_SIZE_DECODE = 32
+        if max_seqlen_q >= 64:
+            TILE_SIZE_PREFILL = 64
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
@@ -1216,7 +1228,10 @@ def unified_attention(
         USE_INTEGER_QK=(
             kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
             and not is_batch_invariant
-            and lab_integer_qk_enabled(q, max_seqlen_q)
+            and (
+                lab_integer_qk_enabled(q, max_seqlen_q)
+                or (tuned_int8_kv and (use_3d or max_seqlen_q >= 64))
+            )
         ),
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
