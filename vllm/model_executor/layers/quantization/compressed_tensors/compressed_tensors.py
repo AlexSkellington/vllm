@@ -801,6 +801,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format
         codebook = _LAB_CODEBOOKS.get(weight_quant.observer)
+        activation_codebook = False
 
         # Apply an explicit integer activation request to existing packed weights.
         # Explicit checkpoint activation metadata keeps precedence.
@@ -817,13 +818,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             if override and not humming_is_layer_skipped(override, prefix):
                 config = resolve_humming_layer_config(override, prefix)
                 dtype = config.get("dtype")
-                if dtype in ("int4", "int8"):
+                if dtype in ("int4", "int8", "iq4nl"):
+                    activation_codebook = dtype == "iq4nl"
                     group_size = config.get("group_size", 0)
                     input_quant = QuantizationArgs(
-                        num_bits=int(dtype[3:]),
+                        num_bits=8 if dtype == "int8" else 4,
                         type=QuantizationType.INT,
                         strategy=(
-                            QuantizationStrategy.GROUP if group_size
+                            QuantizationStrategy.GROUP
+                            if group_size
                             else QuantizationStrategy.TOKEN
                         ),
                         group_size=group_size or None,
@@ -881,7 +884,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             and self._is_wNaM_int(weight_quant, input_quant, format)
         ):
             scheme = (
-                CompressedTensorsWNA4Int if input_quant.num_bits == 4
+                CompressedTensorsWNA4Int
+                if input_quant.num_bits == 4
                 else CompressedTensorsWNA8Int
             )
             return scheme(
@@ -893,6 +897,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 layer_name=layer_name,
                 quant_format=format,
                 codebook=codebook,
+                activation_codebook=activation_codebook,
             )
 
         if self._is_wNa16_group_channel(weight_quant, input_quant) and (

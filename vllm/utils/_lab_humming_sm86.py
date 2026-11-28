@@ -22,13 +22,18 @@ def install() -> None:
     def compatible(input_schema, weight_schema, param_dtype=None):
         input_group = input_schema.input_scale_group_size
         weight_group = weight_schema.weight_scale_group_size
+        group_sizes = (
+            (32, 64, 128) if input_schema.a_dtype == dtypes.int8 else (64, 128)
+        )
         if (
             current_device.sm_version == 86
             and input_schema.a_dtype in (dtypes.int4, dtypes.int8)
             and weight_schema.b_dtype.is_integer_type
             and not weight_schema.has_zero_point
             and weight_schema.weight_scale_type == WeightScaleType.GROUP
-            and {input_group, weight_group} == {64, 128}
+            and input_group != weight_group
+            and input_group in group_sizes
+            and weight_group in group_sizes
         ):
             # The lab MMA header handles promotion at either K scale boundary.
             aligned = dataclasses.replace(

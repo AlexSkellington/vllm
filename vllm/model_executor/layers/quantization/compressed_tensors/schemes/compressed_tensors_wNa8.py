@@ -63,6 +63,7 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         layer_name: str | None = None,
         quant_format: str = "pack-quantized",
         codebook: str | None = None,
+        activation_codebook: bool = False,
     ):
         scheme_name = f"WNA{self.activation_bits}Int"
         self.num_bits = num_bits
@@ -74,15 +75,20 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         self.layer_name = layer_name
         self.quant_format = quant_format
         self.codebook = codebook
+        self.activation_codebook = activation_codebook
+        self.widen_activation = self.activation_bits == 4 and (
+            self.activation_codebook
+            or codebook is not None
+            or num_bits > 4
+            or (num_bits == 4 and not symmetric)
+            or 0 < self.group_size < 64
+            or (input_quant is not None and 0 < (input_quant.group_size or 0) < 64)
+        )
 
         if codebook is not None and (
-            codebook != "iq4nl"
-            or num_bits != 4
-            or not symmetric
-            or self.activation_bits != 8
-            or input_quant is None
+            codebook != "iq4nl" or num_bits != 4 or not symmetric or input_quant is None
         ):
-            raise ValueError("Exact IQ4 codebook weights require symmetric W4A8")
+            raise ValueError("Exact IQ4 codebook weights require symmetric W4")
 
         if num_bits not in WNA16_SUPPORTED_TYPES_MAP:
             raise ValueError(
@@ -104,11 +110,13 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
         )
 
         if input_quant is not None:
+            mma_bits = 8 if self.widen_activation else self.activation_bits
             if (
                 input_quant.type != QuantizationType.INT
                 or input_quant.num_bits != self.activation_bits
-                or num_bits > self.activation_bits
-                or (num_bits == self.activation_bits and not symmetric)
+                or (self.activation_codebook and self.activation_bits != 4)
+                or num_bits > mma_bits
+                or (num_bits == mma_bits and not symmetric)
             ):
                 raise ValueError(
                     f"Unsupported integer W{num_bits}A{self.activation_bits} "
@@ -147,7 +155,7 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
             iq.strategy.value if hasattr(iq.strategy, "value") else iq.strategy
         )
         return {
-            "num_bits": iq.num_bits,
+            "num_bits": 8 if self.widen_activation else iq.num_bits,
             "type": type_val,
             "strategy": strategy_val,
             "symmetric": iq.symmetric,
@@ -191,12 +199,19 @@ class CompressedTensorsWNA8Int(CompressedTensorsScheme):
             mp_config,
             required_kernel=HummingLinearKernel if input_quant_config else None,
         )
-        signature = f"{kernel_type.__name__} W{self.num_bits}A{self.activation_bits}"
+        activation = "nl" if self.activation_codebook else self.activation_bits
+        signature = f"{kernel_type.__name__} W{self.num_bits}A{activation}"
+        if self.codebook:
+            signature += f" ({self.codebook} weight codebook)"
         if signature not in self._kernel_backends_being_used:
             logger.info("Using %s for packed integer linear layers", signature)
             self._kernel_backends_being_used.add(signature)
         if input_quant_config is not None:
             layer._humming_input_quant_config = input_quant_config
+        if self.widen_activation:
+            layer._lab_humming_activation = (
+                "iq4nl" if self.activation_codebook else "int4"
+            )
         if self.codebook is not None:
             layer._lab_codebook = self.codebook
 

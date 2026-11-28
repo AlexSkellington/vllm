@@ -15,6 +15,10 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+from vllm.platforms import current_platform
 
 from tests.models.utils import check_logprobs_close
 from tests.quantization.utils import load_model_without_vllm_runner
@@ -27,9 +31,6 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.scaled_mm import (
     MarlinFP8ScaledMMLinearKernel,
 )
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
@@ -59,7 +60,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
@@ -596,6 +596,7 @@ def test_compressed_tensors_moe_ignore_with_model(vllm_runner):
 
         def check_model(model):
             from vllm.model_executor.layers.fused_moe import MoERunner
+
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
                 CompressedTensorsMoEMethod,
             )
@@ -754,14 +755,17 @@ _DYNAMIC_INT8_ACT = QuantizationArgs(
 
 
 @pytest.mark.parametrize(
-    "weight_bits,activation_bits", [(4, 4), (4, 8), (5, 8), (6, 8), (8, 8)]
+    "activation_dtype,activation_bits", [("int4", 4), ("iq4nl", 4), ("int8", 8)]
 )
-def test_packed_integer_activation_override(weight_bits, activation_bits, monkeypatch):
+@pytest.mark.parametrize("weight_bits", [4, 5, 6, 8])
+def test_packed_integer_activation_override(
+    weight_bits, activation_dtype, activation_bits, monkeypatch
+):
     config = CompressedTensorsConfig({}, [], "pack-quantized")
     weights = QuantizationArgs(num_bits=weight_bits, type="int", group_size=128)
     monkeypatch.setenv(
         "VLLM_HUMMING_INPUT_QUANT_CONFIG",
-        f'{{"dtype":"int{activation_bits}","group_size":128,'
+        f'{{"dtype":"{activation_dtype}","group_size":128,'
         '"dynamic":{"-:^model[.]holdout":{}}}',
     )
     scheme = config._get_scheme_from_parts(weights, None, layer_name="model.proj")
@@ -771,6 +775,10 @@ def test_packed_integer_activation_override(weight_bits, activation_bits, monkey
     assert type(scheme) is expected
     assert scheme.input_quant.num_bits == activation_bits
     assert scheme.input_quant.group_size == 128
+    assert scheme.activation_codebook == (activation_dtype == "iq4nl")
+    assert scheme.widen_activation == (
+        activation_dtype == "iq4nl" or (activation_dtype == "int4" and weight_bits > 4)
+    )
 
     holdout = config._get_scheme_from_parts(weights, None, layer_name="model.holdout")
     assert type(holdout) is CompressedTensorsWNA16
@@ -782,17 +790,27 @@ def test_packed_integer_activation_override(weight_bits, activation_bits, monkey
 
 
 @pytest.mark.parametrize("observer", ["lab_iq4nl", "lab_iq4xs"])
-def test_exact_iq4_codebook_keeps_indices_with_int8(observer, monkeypatch):
+@pytest.mark.parametrize("activation_dtype", ["int4", "iq4nl", "int8", None])
+def test_exact_iq4_codebook_keeps_indices(observer, activation_dtype, monkeypatch):
     config = CompressedTensorsConfig({}, [], "pack-quantized")
-    weights = QuantizationArgs(
-        num_bits=4, type="int", group_size=32, observer=observer
-    )
-    monkeypatch.setenv(
-        "VLLM_HUMMING_INPUT_QUANT_CONFIG", '{"dtype":"int8","group_size":32}'
-    )
+    weights = QuantizationArgs(num_bits=4, type="int", group_size=32, observer=observer)
+    if activation_dtype is not None:
+        monkeypatch.setenv(
+            "VLLM_HUMMING_INPUT_QUANT_CONFIG",
+            f'{{"dtype":"{activation_dtype}","group_size":32}}',
+        )
+    else:
+        monkeypatch.delenv("VLLM_HUMMING_INPUT_QUANT_CONFIG", raising=False)
     scheme = config._get_scheme_from_parts(weights, None, layer_name="model.proj")
-    assert isinstance(scheme, CompressedTensorsWNA8Int)
     assert scheme.codebook == "iq4nl"
+    if activation_dtype is None:
+        assert type(scheme) is CompressedTensorsWNA16
+        return
+    assert type(scheme) is (
+        CompressedTensorsWNA8Int
+        if activation_dtype == "int8"
+        else CompressedTensorsWNA4Int
+    )
     assert scheme.input_quant.group_size == 32
 
 
@@ -981,6 +999,7 @@ def test_compressed_tensors_mxfp8_moe_setup(vllm_runner):
 
         def check_model(model):
             from vllm.model_executor.layers.fused_moe import MoERunner
+
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_mxfp8 import (  # noqa: E501
                 CompressedTensorsW8A8Mxfp8MoEMethod,
             )
@@ -1007,6 +1026,7 @@ def test_humming_supports_compressed_tensors_wna16_quant_key(num_bits):
     from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
         HummingExpertsBase,
     )
+
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa: E501
         WNA16_SUPPORTED_TYPES_MAP,
     )
@@ -1071,9 +1091,10 @@ def test_compressed_tensors_mxfp4(vllm_runner):
 def _mxfp4_moe_layer(monkeypatch, input_activations):
     from types import SimpleNamespace
 
-    from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.model_executor.layers.quantization import mxfp4
 
     # Exercise scheme routing and allocation without selecting a GPU kernel.

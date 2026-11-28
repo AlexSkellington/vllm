@@ -147,6 +147,27 @@ CUDA_INLINE uint32_t lut7_to_f16(uint32_t val) {
   return *reinterpret_cast<uint32_t *>(&v);
 }
 
+template <class TargetType>
+CUDA_INLINE uint32_t iq4nl_to_f16(uint32_t val) {
+  using scalar_t2 = typename F16Conversion<TargetType>::scalar_t2;
+  constexpr uint32_t base =
+      std::is_same<TargetType, Float16>::value ? 0x64006400u : 0x43004300u;
+  const uint32_t selectors = (val & 0xFu) | ((val >> 8) & 0xF00u);
+  const uint32_t low_selectors = selectors & 0x0707u;
+  const uint32_t negative = __byte_perm(0x4153687Fu, 0x0A162331u, low_selectors);
+  const uint32_t positive = __byte_perm(0x26190D01u, 0x71594535u, low_selectors);
+  const uint32_t magnitudes =
+      __byte_perm(negative, positive, 0x3210u | ((selectors & 0x0808u) >> 1));
+  uint32_t biased = base | (magnitudes & 0x007F007Fu);
+  uint32_t offset = base;
+  const scalar_t2 magnitude =
+      __hsub2(*reinterpret_cast<scalar_t2 *>(&biased), *reinterpret_cast<scalar_t2 *>(&offset));
+  const uint32_t negative_selectors = ~selectors & 0x0808u;
+  const uint32_t sign = ((negative_selectors & 0x8u) << 12)
+                        | ((negative_selectors & 0x800u) << 20);
+  return *reinterpret_cast<const uint32_t *>(&magnitude) | sign;
+}
+
 template <class SourceType, class TargetType, bool kHasZeroPoint, bool kIsFpZeroPoint>
 CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
   if constexpr (SourceType::kIsLut) {
@@ -163,7 +184,11 @@ CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
       return __byte_perm(low, high, 0x3210u | ((indices & 0x8888u) >> 1));
     } else {
       static_assert(TargetType::kIsFloatingPointType && TargetType::kBits == 16);
-      return lut7_to_f16<TargetType>(val);
+      if constexpr (SourceType::kLutId == 2) {
+        return iq4nl_to_f16<TargetType>(val);
+      } else {
+        return lut7_to_f16<TargetType>(val);
+      }
     }
   } else
   if constexpr (std::is_same<SourceType, TargetType>::value) {

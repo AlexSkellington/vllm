@@ -13,6 +13,7 @@ from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
 from vllm.model_executor.determinism.batch_invariant import matmul_batch_invariant
 from vllm.model_executor.kernels.linear import (
+    HummingLinearKernel,
     MarlinLinearKernel,
     MPLinearKernel,
     MPLinearLayerConfig,
@@ -71,7 +72,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         layer_name: str | None = None,
         codebook: str | None = None,
     ):
-        self.codebook = codebook  # lab: "iq4nl7" -> Humming Iq4nl7Type (table dequant)
+        self.codebook = codebook
         self.num_bits = num_bits
         self.pack_factor = Fraction(32, num_bits)
         self.strategy = strategy
@@ -81,7 +82,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         # Marlin picks its tiling and K-split from the number of tokens, so its
         # results depend on the batch size. In batch-invariant mode keep the
         # checkpoint layout, unpack the weight and use the batch-invariant matmul.
-        self.use_batch_invariant = envs.VLLM_BATCH_INVARIANT
+        self.use_batch_invariant = envs.VLLM_BATCH_INVARIANT and codebook is None
         self.kernel: MPLinearKernel | None = None
 
         if self.group_size == -1 and self.strategy != "channel":
@@ -103,6 +104,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                 f"num_bits = {num_bits}. Supported: "
                 f"{list(WNA16_ZP_SUPPORTED_TYPES_MAP)}"
             )
+
+        if codebook is not None and (num_bits != 4 or not symmetric):
+            raise ValueError(f"Codebook {codebook} requires symmetric 4-bit weights.")
 
         self.quant_type = (
             WNA16_ZP_SUPPORTED_TYPES_MAP[num_bits]
@@ -148,7 +152,12 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             kernel_type = None
             backend_name = "dequantize + batch-invariant matmul"
         else:
-            kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+            if self.codebook is None:
+                kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+            else:
+                kernel_type = choose_mp_linear_kernel(
+                    mp_linear_kernel_config, required_kernel=HummingLinearKernel
+                )
             backend_name = kernel_type.__name__
 
         if backend_name not in self._kernel_backends_being_used:
@@ -238,13 +247,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         )
 
         if self.codebook is not None:
-            from vllm.model_executor.kernels.linear.mixed_precision.humming import HummingLinearKernel
-
-            if kernel_type is not HummingLinearKernel or self.num_bits != 4 or not self.symmetric:
-                raise ValueError(
-                    f"codebook {self.codebook} weights need 4-bit symmetric layers on Humming, got {backend_name}; "
-                    "set --kernel-config '{\"linear_backend_per_quant\": {\"mixed_precision\": \"humming\"}}'"
-                )
             layer._lab_codebook = self.codebook
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)

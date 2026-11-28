@@ -171,7 +171,10 @@ def prepare_humming_linear_layer_config(
         shape_n_stacks=shape_n_stacks,
         shape_k_stacks=shape_k_stacks,
         param_dtype=layer.params_dtype,
-        convert_symmetric_integer=not preserve_integer_weights,
+        convert_symmetric_integer=(
+            not preserve_integer_weights
+            and getattr(layer, "_lab_codebook", None) is None
+        ),
     )
     input_schema, input_tensors = input_schema.convert_humming(
         tensors=source_tensors,
@@ -255,6 +258,14 @@ def apply_humming_linear(
         get_live_param(layer, "input_scale_2") if mode.has_secondary_scale else None
     )
     flatten_inputs = x.reshape(-1, x.size(-1))
+    if (activation := getattr(layer, "_lab_humming_activation", None)) is not None:
+        from vllm.model_executor.layers.quantization.utils.humming import lab_activation
+
+        flatten_inputs, input_scale = lab_activation.quantize_for_integer_mma(
+            flatten_inputs.contiguous(),
+            layer_config.input_scale_group_size,
+            codebook=activation == "iq4nl",
+        )
     output = humming_forward(
         layer_config,
         inputs=flatten_inputs,

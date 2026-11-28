@@ -57,15 +57,21 @@ VLLM_HUMMING_INPUT_QUANT_CONFIG='{"dtype":"int8","group_size":128}' \
   --kernel-config '{"linear_backend_per_quant":{"mixed_precision":"humming"}}'
 ```
 
-Use `"dtype":"int4"` with symmetric INT4 weights for W4A4. Omit `group_size`
-for per-token activation scaling. Packed checkpoints can also declare dynamic
+Use `"dtype":"int4"` for uniform four-bit activations or `"dtype":"iq4nl"` for
+four-bit activations with the IQ4_NL codebook. Both work with packed INT4, INT5,
+INT6, INT8, IQ4_NL, and IQ4_XS weights. Symmetric W4A4 uses native INT4 MMA
+where the scale groups permit it. The other four-bit modes pass the selected
+activation levels as signed bytes to INT8 MMA. A16 uses the model's FP16 or BF16
+dtype and can be selected by leaving the activation override unset.
+
+Omit `group_size` for per-token activation scaling. Packed checkpoints can also declare dynamic
 integer activation quantization in their own metadata. Incompatible shapes
 or backends produce a load error for explicit integer paths. The Alex_C.T
-Humming build adds SM86 schedules for benchmarked
-projection shapes and support for symmetric nested 64/128 scale groups.
+Humming build adds SM86 schedules for benchmarked projection shapes and nested
+32/64/128 symmetric scale groups for INT8 MMA.
 
-The lab build also supports IQ4_NL and IQ4_XS with INT8 activations. The kernel
-looks up the exact signed IQ4_NL codebook levels in registers before INT8 MMA.
+The lab build looks up the exact signed codebook levels for IQ4_NL and IQ4_XS
+weights in registers before MMA.
 For IQ4_XS, the loader consumes the same indices and the scale of each
 32-weight sub-block. `tools/as1/convert_iq4_tensor.py` exports those fields
 from GGUF for checkpoint assembly. Use `{"dtype":"int8"}` for per-token

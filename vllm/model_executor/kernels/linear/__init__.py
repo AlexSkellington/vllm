@@ -903,7 +903,7 @@ def choose_mp_linear_kernel(
         compute_capability (Optional[int], optional): The compute capability of
             the target device, if None uses `current_platform` to get
             the compute capability. Defaults to None.
-        required_kernel: Kernel required by explicit activation quantization.
+        required_kernel: Kernel required by the checkpoint or activation recipe.
 
     Raises:
         ValueError: If no kernel can implement the given config.
@@ -933,7 +933,7 @@ def choose_mp_linear_kernel(
     if required_kernel is not None:
         if required_kernel not in platform_kernels:
             raise ValueError(
-                f"The requested activation quantization requires "
+                f"The requested quantization requires "
                 f"{required_kernel.__name__}, which the selected backend does not "
                 "allow."
             )
