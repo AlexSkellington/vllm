@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lab (AS1) int8 all-reduce for prefill-sized TP messages (2026-11-23).
+"""Lab INT8 tensor-parallel all-reduce for large, eager messages.
 
-Why: on AS1's two RTX 3090s (PCIe 4.0 via the CPU host bridge, no NVLink) the bf16 NCCL ring all-reduce runs at the
-P2P ceiling (~8.8 GB/s for every NCCL protocol / P2P level) and was 38-39 % of prefill time (nsys, Qwen3.8-27B TP2).
-Fewer bytes is the only lever. Same design as llama.cpp lab patch 0077 (Pascal): int8 payload in small groups with one
-scale per group, companded.
+Each rank quantizes its partial sum into persistent slices. Every rank then
+dequantizes and adds the payloads in the same order. On AS1, TP2 uses CUDA IPC
+to exchange those payloads. Compressed NCCL gathering is also exposed for
+operator comparisons and other TP sizes.
 
-How (any TP size, messages >= LAB_AR_INT8_MIN elements): each rank quantizes its partial sum, one NCCL all-gather
-moves the int8 payloads, every rank dequantizes all payloads and adds them in rank order, so all ranks hold
-bit-identical results (TP requires it). Decode-sized messages (cudagraph capture sizes) never reach this path.
-v2 (2026-11-23): the message is processed in fixed slices through one persistent workspace, so a call allocates only
-its output (like NCCL) - v1's per-call buffers raised vLLM's profiled peak and cost ~10k KV tokens.
-v2 defaults (KLD vs BF16 on Qwen3.8 R1: bf16 0.009471, v1 cube g32 0.009634, v2 sqrt g16 0.009484, cube g16
-0.009588): square-root companding, 16-element groups, fp16 scales (same 1.125 B/element as v1).
-Knobs: LAB_AR_INT8 (default on, =0 off), LAB_AR_INT8_MODE (0 linear, 1 square-root, 2 cube-root companding),
-LAB_AR_INT8_GROUP (16 / 32 elements per scale), LAB_AR_INT8_SCALE (fp16 / fp32), LAB_AR_INT8_SLICE (elements per
-slice), LAB_AR_INT8_MIN (smallest message routed here).
+The default uses square-root companding, 16-element groups and FP16 scales.
+LAB_AR_INT8=0 disables the path. LAB_AR_INT8_MODE selects linear, square-root
+or cube-root companding (0, 1 or 2). LAB_AR_INT8_GROUP and LAB_AR_INT8_SCALE
+set scale granularity and dtype. LAB_AR_INT8_SLICE and LAB_AR_INT8_MIN set
+the slice size and activation threshold in elements.
 """
 
 import os
@@ -32,13 +27,19 @@ def enabled() -> bool:
 MIN_NUMEL = int(os.environ.get("LAB_AR_INT8_MIN", str(1 << 20)))
 MODE = int(os.environ.get("LAB_AR_INT8_MODE", "1"))
 GROUP = int(os.environ.get("LAB_AR_INT8_GROUP", "16"))
-SCALE_DTYPE = torch.float16 if os.environ.get("LAB_AR_INT8_SCALE", "fp16") == "fp16" else torch.float32
+SCALE_DTYPE = (
+    torch.float16
+    if os.environ.get("LAB_AR_INT8_SCALE", "fp16") == "fp16"
+    else torch.float32
+)
 SLICE = int(os.environ.get("LAB_AR_INT8_SLICE", str(2 << 20)))
 SCALE_ELEM_SIZE = torch.tensor([], dtype=SCALE_DTYPE).element_size()
 
 
 @triton.jit
-def _quant_kernel(x_ptr, q_ptr, s_ptr, n_groups, MODE: tl.constexpr, R: tl.constexpr, G: tl.constexpr):
+def _quant_kernel(
+    x_ptr, q_ptr, s_ptr, n_groups, MODE: tl.constexpr, R: tl.constexpr, G: tl.constexpr
+):
     g = tl.program_id(0) * R + tl.arange(0, R)
     gm = g < n_groups
     offs = g[:, None] * G + tl.arange(0, G)[None, :]
@@ -50,24 +51,38 @@ def _quant_kernel(x_ptr, q_ptr, s_ptr, n_groups, MODE: tl.constexpr, R: tl.const
         a = tl.abs(x)
         c = tl.where(a > 0, tl.exp(tl.log(tl.maximum(a, 1e-30)) * (1.0 / 3.0)), 0.0)
         x = tl.where(x < 0, -c, c)
-    s = tl.max(tl.abs(x), axis=1).to(s_ptr.dtype.element_ty).to(tl.float32)   # quantize with the stored scale
+    s = (
+        tl.max(tl.abs(x), axis=1).to(s_ptr.dtype.element_ty).to(tl.float32)
+    )  # quantize with the stored scale
     inv = tl.where(s > 0, 127.0 / s, 0.0)
     q = x * inv[:, None]
-    q = tl.where(q >= 0, q + 0.5, q - 0.5).to(tl.int32)                        # round half away from zero
+    q = tl.where(q >= 0, q + 0.5, q - 0.5).to(tl.int32)  # round half away from zero
     q = tl.minimum(tl.maximum(q, -127), 127).to(tl.int8)
     tl.store(q_ptr + offs, q, mask=gm[:, None])
     tl.store(s_ptr + g, s.to(s_ptr.dtype.element_ty), mask=gm)
 
 
 @triton.jit
-def _dequant_sum_kernel(q_ptr, s_ptr, out_ptr, n_groups, q_stride, s_stride, WORLD: tl.constexpr, MODE: tl.constexpr,
-                        R: tl.constexpr, G: tl.constexpr):
+def _dequant_sum_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    n_groups,
+    q_stride,
+    s_stride,
+    WORLD: tl.constexpr,
+    MODE: tl.constexpr,
+    R: tl.constexpr,
+    G: tl.constexpr,
+):
     g = tl.program_id(0) * R + tl.arange(0, R)
     gm = g < n_groups
     offs = g[:, None] * G + tl.arange(0, G)[None, :]
     acc = tl.zeros((R, G), dtype=tl.float32)
-    for r in tl.static_range(WORLD):                                            # fixed rank order on every rank
-        q = tl.load(q_ptr + r * q_stride + offs, mask=gm[:, None], other=0).to(tl.float32)
+    for r in tl.static_range(WORLD):  # fixed rank order on every rank
+        q = tl.load(q_ptr + r * q_stride + offs, mask=gm[:, None], other=0).to(
+            tl.float32
+        )
         s = tl.load(s_ptr + r * s_stride + g, mask=gm, other=0.0).to(tl.float32)
         v = q * (s * (1.0 / 127.0))[:, None]
         if MODE == 1:
@@ -79,8 +94,17 @@ def _dequant_sum_kernel(q_ptr, s_ptr, out_ptr, n_groups, q_stride, s_stride, WOR
 
 
 @triton.jit
-def _dequant_sum2_kernel(q0_ptr, s0_ptr, q1_ptr, s1_ptr, out_ptr, n_groups, MODE: tl.constexpr, R: tl.constexpr,
-                         G: tl.constexpr):
+def _dequant_sum2_kernel(
+    q0_ptr,
+    s0_ptr,
+    q1_ptr,
+    s1_ptr,
+    out_ptr,
+    n_groups,
+    MODE: tl.constexpr,
+    R: tl.constexpr,
+    G: tl.constexpr,
+):
     # TP2 variant for the IPC exchange: payload0 from rank 0, payload1 from rank 1,
     # same op order as _dequant_sum_kernel so results are bit-identical for
     # identical payloads.
@@ -106,19 +130,24 @@ def _dequant_sum2_kernel(q0_ptr, s0_ptr, q1_ptr, s1_ptr, out_ptr, n_groups, MODE
     tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=gm[:, None])
 
 
-
 def applies(x: torch.Tensor, world_size: int) -> bool:
-    return (enabled() and world_size >= 2 and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)
-            and x.numel() >= MIN_NUMEL and x.numel() % GROUP == 0 and x.is_contiguous()
-            and not torch.cuda.is_current_stream_capturing())
+    return (
+        enabled()
+        and world_size >= 2
+        and x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.numel() >= MIN_NUMEL
+        and x.numel() % GROUP == 0
+        and x.is_contiguous()
+        and not torch.cuda.is_current_stream_capturing()
+    )
 
 
 _WS = {}
 
 
 def _workspace(device, world, slice_n):
-    """One persistent workspace per (device, stream): [own payload | all payloads], payload = int8 slice + scales.
-    Calls on one stream are ordered, so slices and calls can reuse it; another stream gets its own."""
+    """Allocate persistent local and gathered payloads for one device stream."""
     sb = torch.tensor([], dtype=SCALE_DTYPE).element_size()
     pay = slice_n + (slice_n // GROUP) * sb
     key = (device, torch.cuda.current_stream(device).cuda_stream, world, pay)
@@ -142,7 +171,10 @@ def all_reduce(pynccl_comm, x: torch.Tensor, ipc=None):
     R = max(1, 512 // GROUP)
     sb = SCALE_ELEM_SIZE
     if ipc is not None and not getattr(ipc, "disabled", True) and world == 2:
-        sl = min(SLICE - SLICE % GROUP, int(ipc.max_payload / (1 + sb / GROUP)))
+        sl = min(SLICE // GROUP, ipc.max_payload // (GROUP + sb)) * GROUP
+        if sl <= 0:
+            return None
+        stream = ipc.order_stream()
         for start in range(0, n, sl):
             m = min(sl, n - start)
             ng = m // GROUP
@@ -151,30 +183,59 @@ def all_reduce(pynccl_comm, x: torch.Tensor, ipc=None):
             q = own[:m].view(torch.int8)
             sc = own[m:pm].view(SCALE_DTYPE)
             grid = (triton.cdiv(ng, R),)
-            _quant_kernel[grid](xf[start:start + m], q, sc, ng, MODE=MODE, R=R, G=GROUP)
+            _quant_kernel[grid](
+                xf[start : start + m], q, sc, ng, MODE=MODE, R=R, G=GROUP
+            )
             ipc.publish_and_wait()
             if ipc.rank == 0:
-                q0, s0, q1, s1 = q, sc, peer[:m].view(torch.int8), peer[m:pm].view(SCALE_DTYPE)
+                q0, s0, q1, s1 = (
+                    q,
+                    sc,
+                    peer[:m].view(torch.int8),
+                    peer[m:pm].view(SCALE_DTYPE),
+                )
             else:
-                q0, s0, q1, s1 = peer[:m].view(torch.int8), peer[m:pm].view(SCALE_DTYPE), q, sc
-            _dequant_sum2_kernel[grid](q0, s0, q1, s1, of[start:start + m], ng, MODE=MODE, R=R, G=GROUP)
+                q0, s0, q1, s1 = (
+                    peer[:m].view(torch.int8),
+                    peer[m:pm].view(SCALE_DTYPE),
+                    q,
+                    sc,
+                )
+            _dequant_sum2_kernel[grid](
+                q0, s0, q1, s1, of[start : start + m], ng, MODE=MODE, R=R, G=GROUP
+            )
+        ipc.record_consumption(stream)
         return out
     sl = SLICE - SLICE % GROUP
     ws, pay, sb = _workspace(x.device, world, sl)
     for start in range(0, n, sl):
         m = min(sl, n - start)
         ng = m // GROUP
-        pm = m + ng * sb                             # this slice's payload: int8 values then scales (sends no padding)
+        pm = (
+            m + ng * sb
+        )  # this slice's payload: int8 values then scales (sends no padding)
         own = ws[:pm]
         q = own[:m].view(torch.int8)
-        s = own[m:pm].view(SCALE_DTYPE)              # m % GROUP == 0 keeps the scales 2/4-byte aligned
+        s = own[m:pm].view(
+            SCALE_DTYPE
+        )  # m % GROUP == 0 keeps the scales 2/4-byte aligned
         grid = (triton.cdiv(ng, R),)
-        _quant_kernel[grid](xf[start:start + m], q, s, ng, MODE=MODE, R=R, G=GROUP)
-        allbuf = ws[pay:pay + world * pm]
+        _quant_kernel[grid](xf[start : start + m], q, s, ng, MODE=MODE, R=R, G=GROUP)
+        allbuf = ws[pay : pay + world * pm]
         pynccl_comm.all_gather(allbuf, own)
         a2 = allbuf.view(world, pm)
         allq = a2[:, :m].view(torch.int8)
         alls = a2[:, m:pm].view(SCALE_DTYPE)
-        _dequant_sum_kernel[grid](allq, alls, of[start:start + m], ng, pm, pm // sb, WORLD=world, MODE=MODE,
-                                  R=R, G=GROUP)
+        _dequant_sum_kernel[grid](
+            allq,
+            alls,
+            of[start : start + m],
+            ng,
+            pm,
+            pm // sb,
+            WORLD=world,
+            MODE=MODE,
+            R=R,
+            G=GROUP,
+        )
     return out

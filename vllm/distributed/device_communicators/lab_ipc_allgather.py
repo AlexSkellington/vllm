@@ -12,8 +12,8 @@ safely on this PCIe-only TP2 box.
 TP2 only (other world sizes keep the NCCL path). Eager-only: the int8 AR path
 is never used under graph capture, and setup (one gloo object exchange of
 torch CUDA-IPC handles plus a functional canary that doubles as the P2P
-check) runs at worker init. Any setup failure disables the module and the
-caller falls back to pynccl all_gather.
+check) runs at worker init. Both ranks must pass setup before the
+communicator can use the exchange.
 
 Protocol (one in-flight message per rank, round-robin slot = seq & 1):
   1. quantize the slice payload into own_buf[slot]
@@ -66,54 +66,77 @@ class LabIpcAllGather:
         self.rank = rank
         self.world = world
         self.device = torch.device(device)
-        self.max_payload = int(os.environ.get("LAB_AR_IPC_MAX_MB", "32")) << 20
+        self.max_payload = 0
         self.own_buf: torch.Tensor | None = None
         self.peer_buf: torch.Tensor | None = None
         self.own_flag: torch.Tensor | None = None
         self.peer_flag: torch.Tensor | None = None
+        self._last_stream: torch.cuda.Stream | None = None
+        self._consumed = None
         self.seq = 0
 
         if world != 2:
-            logger.info_once("lab IPC all-gather: world=%d != 2; staying disabled (NCCL path)",
-                             world)
+            logger.info_once(
+                "lab IPC all-gather: world=%d != 2; staying disabled (NCCL path)", world
+            )
             self.disabled = True
             return
-        if self.device.type != "cuda":
-            logger.info_once("lab IPC all-gather: no cuda device; staying disabled")
-            self.disabled = True
-            return
-
-        slot = self.max_payload
-        self.own_buf = torch.empty(2 * slot + FLAG_BYTES, dtype=torch.uint8,
-                                   device=self.device)
-        _fn, args = reduce_tensor(self.own_buf)
+        local_handle = None
+        try:
+            self.max_payload = int(os.environ.get("LAB_AR_IPC_MAX_MB", "32")) << 20
+            if self.device.type == "cuda" and self.max_payload > 0:
+                slot = self.max_payload
+                self.own_buf = torch.empty(
+                    2 * slot + FLAG_BYTES, dtype=torch.uint8, device=self.device
+                )
+                self.own_flag = self.own_buf[-FLAG_BYTES:].view(torch.uint64)
+                self.own_flag.zero_()
+                torch.cuda.current_stream(self.device).synchronize()
+                _, args = reduce_tensor(self.own_buf)
+                local_handle = (slot, args)
+        except (TypeError, ValueError, RuntimeError):
+            logger.exception("lab IPC all-gather could not export local storage")
         gathered: list = [None] * 2
-        dist.all_gather_object(gathered, args, group=cpu_group)
-        peer_args = list(gathered[1 - rank])
-        # Rebuild the peer storage in OUR device context. The pickled
-        # storage_device (arg 6) is the peer ordinal; taken as-is it opens
-        # the IPC handle in the peer device context. Host copies work from
-        # there (canary) but triton's context-relative cuPointerGetAttribute
-        # pointer check rejects the pointer when the kernel launches on our
-        # own device. _share_cuda_ yields torch's C++ device encoding (a
-        # Python pickle is rejected by _new_shared_cuda).
-        _dev_bytes = torch.empty(8, device=self.device)._typed_storage()._share_cuda_()[0]
-        peer_args[6] = _dev_bytes
-        self.peer_buf = rebuild_cuda_tensor(*peer_args)
-        self.own_flag = self.own_buf[2 * slot:2 * slot + FLAG_BYTES].view(torch.uint64)
-        self.peer_flag = self.peer_buf[2 * slot:2 * slot + FLAG_BYTES].view(torch.uint64)
-
-        if not self._canary():
-            logger.warning_once("lab IPC all-gather canary failed (P2P mapping?); "
-                                "falling back to NCCL all-gather")
-            self.disabled = True
-            self.own_buf = None
-            self.peer_buf = None
-            self.own_flag = None
-            self.peer_flag = None
+        dist.all_gather_object(gathered, local_handle, group=cpu_group)
+        if any(handle is None or handle[0] != self.max_payload for handle in gathered):
+            self._disable()
             return
-        logger.info_once("lab IPC all-gather ready: TP2, %d MB payload/slot "
-                         "(2 slots per GPU)", slot >> 20)
+
+        mapped = False
+        try:
+            peer_args = list(gathered[1 - rank][1])
+            # CUDA IPC storage must be opened in the receiving device context.
+            # Reuse the local handle's encoded device for rebuild_cuda_tensor.
+            peer_args[6] = gathered[rank][1][6]
+            with torch.cuda.device(self.device):
+                self.peer_buf = rebuild_cuda_tensor(*peer_args)
+                self.peer_flag = self.peer_buf[-FLAG_BYTES:].view(torch.uint64)
+                self._consumed = torch.cuda.Event()
+            mapped = True
+        except (TypeError, ValueError, RuntimeError):
+            logger.exception("lab IPC all-gather could not map peer storage")
+        if not self._both_ready(cpu_group, mapped):
+            self._disable()
+            return
+        if not self._both_ready(cpu_group, self._canary()):
+            self._disable()
+            return
+        logger.info_once(
+            "lab IPC all-gather ready: TP2, %d MB payload/slot (2 slots per GPU)",
+            self.max_payload >> 20,
+        )
+
+    @staticmethod
+    def _both_ready(cpu_group, local: bool) -> bool:
+        ready = torch.tensor(int(local), dtype=torch.int32, device="cpu")
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=cpu_group)
+        return bool(ready.item())
+
+    def _disable(self):
+        logger.warning_once("lab IPC all-gather disabled on both ranks")
+        self.disabled = True
+        self.own_buf = self.peer_buf = None
+        self.own_flag = self.peer_flag = None
 
     def _canary(self) -> bool:
         """Symmetric round-trip with a bounded host wait; this IS the P2P
@@ -133,9 +156,18 @@ class LabIpcAllGather:
             torch.cuda.synchronize(self.device)
             return self.peer_buf[0].item() == expect
         except Exception:
-            logger.exception("lab IPC all-gather canary raised; falling back to "
-                             "NCCL all-gather")
+            logger.exception("lab IPC all-gather canary raised")
             return False
+
+    def order_stream(self) -> torch.cuda.Stream:
+        stream = torch.cuda.current_stream(self.device)
+        if self._last_stream is not None and stream != self._last_stream:
+            stream.wait_event(self._consumed)
+        return stream
+
+    def record_consumption(self, stream: torch.cuda.Stream) -> None:
+        self._consumed.record(stream)
+        self._last_stream = stream
 
     def begin(self, payload_bytes: int):
         """Reserve the next round-robin slot. Returns (own_view, peer_view),
@@ -145,8 +177,8 @@ class LabIpcAllGather:
         assert 0 < payload_bytes <= self.max_payload
         self.seq += 1
         off = ((self.seq - 1) & 1) * self.max_payload
-        own = self.own_buf[off:off + payload_bytes]
-        peer = self.peer_buf[off:off + payload_bytes]
+        own = self.own_buf[off : off + payload_bytes]
+        peer = self.peer_buf[off : off + payload_bytes]
         return own, peer
 
     def publish_and_wait(self):

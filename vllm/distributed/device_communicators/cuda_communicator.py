@@ -24,9 +24,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
+from . import lab_int8_allreduce as _lab_i8
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
-from . import lab_int8_allreduce as _lab_i8
 from .lab_ipc_allgather import LabIpcAllGather
 
 logger = init_logger(__name__)
@@ -119,9 +119,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.lab_ipc_ag: LabIpcAllGather | None = None
         # lab: int8 AR payload exchange over persistent CUDA-IPC buffers (v3);
         # replaces the NCCL all-gather that deadlocked on mixed prefill+decode
-        # steps. TP2 only; auto-disables on any setup failure (NCCL path kept).
+        # steps. When TP2 IPC is unavailable, use the normal all-reduce.
         if (
-            self.world_size > 1
+            self.world_size == 2
             and unique_name.split(":")[0] == "tp"
             and os.environ.get("LAB_AR_INT8", "1") != "0"
             and os.environ.get("LAB_AR_IPC", "auto") != "0"
@@ -132,9 +132,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 )
             except Exception:
                 logger.exception(
-                    "lab IPC all-gather setup failed; falling back to NCCL all-gather"
+                    "lab IPC all-gather setup failed; using normal all-reduce"
                 )
                 self.lab_ipc_ag = None
+        self._lab_ipc_dispatch_logged = False
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
@@ -406,10 +407,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
-        # lab: int8 all-reduce for prefill-sized messages (lab_int8_allreduce.py; opt out LAB_AR_INT8=0)
-        if _lab_i8.applies(input_, self.world_size):
+        # Lab INT8 all-reduce for prefill-sized messages.
+        ipc_ready = self.lab_ipc_ag is not None and not self.lab_ipc_ag.disabled
+        if (self.world_size != 2 or ipc_ready) and _lab_i8.applies(
+            input_, self.world_size
+        ):
             _lab_out = _lab_i8.all_reduce(self.pynccl_comm, input_, self.lab_ipc_ag)
             if _lab_out is not None:
+                if ipc_ready and not self._lab_ipc_dispatch_logged:
+                    logger.info("lab INT8 IPC all-reduce active for prefill")
+                    self._lab_ipc_dispatch_logged = True
                 return _lab_out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (

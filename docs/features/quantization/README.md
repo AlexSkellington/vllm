@@ -96,6 +96,12 @@ INT8 query–key path for split-K decode on `int8_per_token_head`. It also widen
 the decode KV tiles and uses more split-K segments when few requests would
 otherwise underfill the GPU.
 
+On AS1, `LAB_AR_INT8=1` with `LAB_AR_IPC=auto` enables the lab's CUDA IPC
+all-reduce for large, eager TP2 messages. The two ranks agree on IPC
+availability at startup and use the normal all-reduce if either rank cannot
+use it. With the default 2,097,152-element slice, `LAB_AR_IPC_MAX_MB=8`
+reserves two 8 MiB payload slots per GPU.
+
 ## Supported Hardware
 
 The table below shows the compatibility of various quantization implementations with different hardware platforms in vLLM:
