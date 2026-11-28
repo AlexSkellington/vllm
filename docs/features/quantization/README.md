@@ -92,9 +92,9 @@ speculative decoding settings before choosing a serving configuration.
 batches using packed INT4 KV on SM86. It parallelizes the cache scan across
 segments and combines their softmax statistics before writing the output.
 For 256-wide heads on SM86, `VLLM_LAB_INT8_KV_TUNED=1` enables the Alex_C.T
-INT8 query–key path for split-K decode and large prefill on
-`int8_per_token_head`. It also widens the KV tiles and uses more split-K
-segments when few requests would otherwise underfill the GPU.
+INT8 query–key path for split-K decode on `int8_per_token_head`. It also widens
+the decode KV tiles and uses more split-K segments when few requests would
+otherwise underfill the GPU.
 
 ## Supported Hardware
 

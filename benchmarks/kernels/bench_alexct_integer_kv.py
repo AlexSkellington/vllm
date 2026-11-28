@@ -124,7 +124,11 @@ def run(length, rows, dim, split_k, tuned_int8):
             reference = out.float()
             invoke(1)
             error = ((out.float() - reference).norm() / reference.norm()).item()
-            if (split_k and m == 1) or (not split_k and not tuned_int8 and m < 64):
+            if (
+                (split_k and m == 1)
+                or (tuned_int8 and m > 8)
+                or (not split_k and not tuned_int8 and m < 64)
+            ):
                 assert error == 0
             tolerance = 0.005 if split_k else 0.025
             assert error < tolerance, (bits, m, error)

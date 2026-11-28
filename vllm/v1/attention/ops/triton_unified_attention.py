@@ -1027,13 +1027,12 @@ def unified_attention(
     )
     tuned_int8_kv = (
         kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        and max_seqlen_q <= MAX_3D_QUERY_LEN
         and q.dtype in (torch.float16, torch.bfloat16)
         and lab_int8_kv_tuned_enabled(q.device, head_size)
     )
     if tuned_int8_kv:
         TILE_SIZE_DECODE = 32
-        if max_seqlen_q >= 64:
-            TILE_SIZE_PREFILL = 64
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
@@ -1228,10 +1227,7 @@ def unified_attention(
         USE_INTEGER_QK=(
             kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
             and not is_batch_invariant
-            and (
-                lab_integer_qk_enabled(q, max_seqlen_q)
-                or (tuned_int8_kv and (use_3d or max_seqlen_q >= 64))
-            )
+            and (lab_integer_qk_enabled(q, max_seqlen_q) or (tuned_int8_kv and use_3d))
         ),
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
